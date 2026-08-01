@@ -254,8 +254,9 @@ async def set_status(seq: int, req: StatusReq,
         m = await js.get_msg(STREAM, seq)
     except Exception:
         raise HTTPException(404, "message not found")
-    data = json.loads(m.data)
-    if data.get("to") != me:
+    # 归属校验: 按消息 subject 判断落在谁的收件箱, 而非消息体 to 字段。
+    # notice 广播副本 to=notice 但 subject=a2a.<me>.inbox — 收件人应能标自己的副本。
+    if m.subject != f"a2a.{me}.inbox":
         raise HTTPException(403, "not your message")
     await kv.put(str(seq), req.status.encode())
     return {"id": seq, "status": req.status}
