@@ -103,6 +103,7 @@ class SendReq(BaseModel):
     body: str = ""
     reply_to: int | None = None
     thread: str | None = None
+    msg_id: str | None = None   # 幂等键: 同 msg_id 在 DuplicateWindow(2m) 内只存一条
 
 
 @app.post("/api/send")
@@ -120,17 +121,19 @@ async def send(req: SendReq, authorization: str | None = Header(default=None)):
         "thread": req.thread,
         "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    # 幂等: 有 msg_id 时加 Nats-Msg-Id header, stream DuplicateWindow(2m) 内同 id 只存一条
+    hdrs = {"Nats-Msg-Id": req.msg_id} if req.msg_id else None
     # 全网通知: to=notice → 扇出复制到每个注册 agent 的收件箱 (各自独立 seq + 状态)
     if req.to == NOTICE:
         targets = sorted(set(_TOKEN2AGENT.values()))
         seqs = []
         for t in targets:
-            ack = await js.publish(f"a2a.{t}.inbox", json.dumps(msg).encode())
+            ack = await js.publish(f"a2a.{t}.inbox", json.dumps(msg).encode(), headers=hdrs)
             await kv.put(str(ack.seq), b"unread")
             seqs.append(ack.seq)
         return {"id": seqs[0], "status": "unread", "to": req.to,
                 "broadcast_to": targets, "seqs": seqs}
-    ack = await js.publish(f"a2a.{req.to}.inbox", json.dumps(msg).encode())
+    ack = await js.publish(f"a2a.{req.to}.inbox", json.dumps(msg).encode(), headers=hdrs)
     seq = ack.seq
     await kv.put(str(seq), b"unread")
     return {"id": seq, "status": "unread", "to": req.to}

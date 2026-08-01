@@ -24,6 +24,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
+import uuid
 
 DEFAULT_URL = os.environ.get("A2A_URL", "http://100.68.80.91:3010")
 TOKENS_FILE = os.path.expanduser("~/projects/a2a-bus/tokens.env")
@@ -118,7 +119,8 @@ def cmd_inbox(args, base, tok):
 
 def cmd_send(args, base, tok):
     body = args.body or ""
-    payload = {"to": args.to, "subject": args.subject, "body": body}
+    payload = {"to": args.to, "subject": args.subject, "body": body,
+               "msg_id": str(uuid.uuid4())}  # 幂等键, 服务端 DuplicateWindow 内同 id 去重
     if args.reply_to:
         payload["reply_to"] = args.reply_to
     code, d = req(base, "/api/send", tok, "POST", payload)
@@ -128,7 +130,8 @@ def cmd_send(args, base, tok):
 
 
 def cmd_reply(args, base, tok):
-    payload = {"to": args.to, "subject": args.subject, "body": args.body, "reply_to": args.id}
+    payload = {"to": args.to, "subject": args.subject, "body": args.body,
+               "reply_to": args.id, "msg_id": str(uuid.uuid4())}
     code, d = req(base, "/api/send", tok, "POST", payload)
     if code != 200:
         sys.exit(f"ERROR {code}: {d}")
