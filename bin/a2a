@@ -57,6 +57,8 @@ def resolve_token(args) -> tuple[str, str]:
 
 
 def req(base, path, token, method="GET", body=None, timeout=30):
+    # 强制直连：绕过系统代理（腾讯云主机有 Mihomo 等代理时会劫持 Tailscale IP 请求 → 502）
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     r = urllib.request.Request(base + path, method=method)
     r.add_header("Authorization", f"Bearer {token}")
     r.add_header("User-Agent", "a2a-cli")
@@ -64,7 +66,7 @@ def req(base, path, token, method="GET", body=None, timeout=30):
         r.add_header("Content-Type", "application/json")
         r.data = json.dumps(body, ensure_ascii=False).encode()
     try:
-        with urllib.request.urlopen(r, timeout=timeout) as resp:
+        with opener.open(r, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         try:
@@ -72,6 +74,9 @@ def req(base, path, token, method="GET", body=None, timeout=30):
         except Exception:
             err = {"detail": str(e)}
         return e.code, err
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        hint = "（本机没有 a2a 服务？用 --url http://100.68.80.91:3010 或设 A2A_URL 指向 Oracle 节点）" if "127.0.0.1" in base else ""
+        sys.exit(f"ERROR: 无法连接 {base} — {e} {hint}")
 
 
 def fmt_msg(m) -> str:
@@ -144,10 +149,11 @@ def cmd_status(args, base, tok):
 
 def cmd_watch(args, base, tok):
     import urllib.request as u
+    opener = u.build_opener(u.ProxyHandler({}))  # 绕过系统代理，理由同 req()
     r = u.Request(base + "/api/events")
     r.add_header("Authorization", f"Bearer {tok}")
     try:
-        resp = u.urlopen(r, timeout=None)
+        resp = opener.open(r, timeout=None)
     except Exception as e:
         sys.exit(f"ERROR 连接 SSE: {e}")
     print("监听中... (Ctrl-C 退出)", file=sys.stderr)
