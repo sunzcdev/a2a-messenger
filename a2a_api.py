@@ -173,6 +173,9 @@ def _sort_key(it: dict):
 async def inbox(agent: str, authorization: str | None = Header(default=None),
                 since: int | None = None, limit: int = 200, unread_only: bool = False):
     me = require_agent(authorization)
+    if agent == NOTICE:
+        raise HTTPException(400,
+            "notice 是广播地址, 副本已分发到各收件箱, 请用 /api/inbox/me 查自己的收件箱")
     if agent == "me":
         agent = me
     if agent != me:
