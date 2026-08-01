@@ -41,6 +41,7 @@ for pair in os.environ.get("A2A_TOKENS", "").split(","):
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 VALID_STATUS = ("unread", "read", "replied", "archived", "recalled")
 NOTICE = "notice"  # 全网通知地址: to=notice → 广播给所有注册 agent
+ROOM_RE = re.compile(r"^room:[a-z0-9][a-z0-9-]{0,31}$")  # 房间: to=room:<topic>
 
 nc = None
 js = None
@@ -81,7 +82,9 @@ async def lifespan(_app):
     except Exception:
         await js.add_stream(StreamConfig(
             name=STREAM,
-            subjects=["a2a.*.inbox"],
+            # 注: 房间 subject 用 room.> 而非 a2a.room.> — a2a.*.inbox 与 a2a.room.>
+            # 在 a2a.room.inbox 重叠, NATS server (10052) 禁止同 stream 重叠 subjects
+            subjects=["a2a.*.inbox", "room.>"],  # T10: 房间频道
             retention=RetentionPolicy.LIMITS,
             max_age=90 * 24 * 3600,
             max_msgs=1_000_000,
@@ -124,6 +127,8 @@ async def send(req: SendReq, authorization: str | None = Header(default=None)):
         # notice 是广播地址: 展开为所有注册 agent, notice 自身不投递
         targets = sorted((set(targets) - {NOTICE}) | set(_TOKEN2AGENT.values()))
     for t in targets:
+        if ROOM_RE.match(t):
+            continue  # room 目标不是 slug
         check_slug(t)
     if not req.subject.strip():
         raise HTTPException(400, "subject required")
@@ -144,10 +149,19 @@ async def send(req: SendReq, authorization: str | None = Header(default=None)):
     seqs = []
     for t in targets:
         per_msg_id = f"{req.msg_id}:{t}" if req.msg_id else str(uuid.uuid4())
-        ack = await js.publish(f"a2a.{t}.inbox", json.dumps(msg).encode(),
-                               headers={"Nats-Msg-Id": per_msg_id})
-        await kv.put(str(ack.seq), b"unread")
-        seqs.append(ack.seq)
+        if ROOM_RE.match(t):
+            # 房间消息 (T10): publish 到 room.<topic>, 带 room 标记;
+            # 共享频道无个人已读概念, 不建 KV 状态
+            topic = t.split(":", 1)[1]
+            room_msg = {**msg, "room": topic}
+            ack = await js.publish(f"room.{topic}", json.dumps(room_msg).encode(),
+                                   headers={"Nats-Msg-Id": per_msg_id})
+            seqs.append(ack.seq)
+        else:
+            ack = await js.publish(f"a2a.{t}.inbox", json.dumps(msg).encode(),
+                                   headers={"Nats-Msg-Id": per_msg_id})
+            await kv.put(str(ack.seq), b"unread")
+            seqs.append(ack.seq)
     if raw_to == NOTICE:
         return {"id": seqs[0], "status": "unread", "to": NOTICE,
                 "broadcast_to": targets, "seqs": seqs}
@@ -165,6 +179,7 @@ def _msg_item(seq: int, data: dict, status: str) -> dict:
         "body": data.get("body"),
         "reply_to": data.get("reply_to"),
         "thread": data.get("thread"),
+        "room": data.get("room"),
         "created": data.get("created"),
         "status": status,
     }
@@ -187,26 +202,15 @@ def _sort_key(it: dict):
         return (1, datetime.min.replace(tzinfo=timezone.utc), it["id"])
 
 
-@app.get("/api/inbox/{agent}")
-async def inbox(agent: str, authorization: str | None = Header(default=None),
-                since: int | None = None, limit: int = 200, unread_only: bool = False,
-                thread: str | None = None):
-    me = require_agent(authorization)
-    if agent == NOTICE:
-        raise HTTPException(400,
-            "notice 是广播地址, 副本已分发到各收件箱, 请用 /api/inbox/me 查自己的收件箱")
-    if agent == "me":
-        agent = me
-    if agent != me:
-        raise HTTPException(403, "can only read own inbox")
-    check_slug(agent)
+async def _fetch_inbox(subject: str, since, limit, unread_only, thread) -> list[dict]:
+    """从 subject 拉取消息 (循环 fetch 直到拉完), 返回排序+过滤后的 items。"""
     # 循环 fetch 直到拉完: fetch 从最旧开始, 收件箱 > 批量时单次会被截断,
     # 不拉完就取不到最新 limit 条。JetStream pull consumer 默认 max_ack_pending=1000
     # 限制单次投递量, 故: a) 批量固定 1000 (≤ 配额, server 能足额投递, "返回数<批量"
     # 即为拉完); b) 每批收齐后立即 ack 释放配额, 才能拉下一批。consumer 为本次查询
     # 临时创建、用完即删, ack 无副作用 (unread 状态在 KV, 与 ack 无关)。
     fetch_n = 1000
-    sub = await js.pull_subscribe(f"a2a.{agent}.inbox")
+    sub = await js.pull_subscribe(subject)
     try:
         msgs = []
         while True:
@@ -240,6 +244,30 @@ async def inbox(agent: str, authorization: str | None = Header(default=None),
         items = [it for it in items if it["id"] > since]
     else:
         items = items[-limit:]  # 无 since → 最新 limit 条
+    return items
+
+
+@app.get("/api/inbox/{agent}")
+async def inbox(agent: str, authorization: str | None = Header(default=None),
+                since: int | None = None, limit: int = 200, unread_only: bool = False,
+                thread: str | None = None):
+    me = require_agent(authorization)
+    if agent == NOTICE:
+        raise HTTPException(400,
+            "notice 是广播地址, 副本已分发到各收件箱, 请用 /api/inbox/me 查自己的收件箱")
+    if agent.startswith("room:"):
+        # 房间是共享频道 (T10, 开会用): 任何 agent 可读, 从 room.<topic> 拉
+        topic = agent.split(":", 1)[1]
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", topic):
+            raise HTTPException(400, f"invalid room topic: {topic!r}")
+        items = await _fetch_inbox(f"room.{topic}", since, limit, unread_only, thread)
+        return {"agent": agent, "count": len(items), "messages": items}
+    if agent == "me":
+        agent = me
+    if agent != me:
+        raise HTTPException(403, "can only read own inbox")
+    check_slug(agent)
+    items = await _fetch_inbox(f"a2a.{agent}.inbox", since, limit, unread_only, thread)
     return {"agent": agent, "count": len(items), "messages": items}
 
 
