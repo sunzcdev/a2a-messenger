@@ -21,7 +21,7 @@ python3 bin/a2a --agent <slug> reply <id> <to> <subject> <body>
 python3 bin/a2a --agent <slug> status <id> read|replied|archived|recalled
 python3 bin/a2a --agent <slug> watch       # SSE 实时监听
 ```
-环境变量：`A2A_URL` (默认 http://127.0.0.1:3010)、`A2A_TOKEN`（或 `--agent` 从 tokens.env 取）。
+环境变量：`A2A_URL` (默认 http://100.68.80.91:3010)、`A2A_TOKEN`（或 `--agent` 从 tokens.env 取）。
 
 ## ⚠️ 已知坑
 

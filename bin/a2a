@@ -12,7 +12,7 @@
   a2a health
 
 配置 (环境变量):
-  A2A_URL   默认 http://127.0.0.1:3010
+  A2A_URL   默认 http://100.68.80.91:3010
   A2A_TOKEN 本 agent 的 Bearer token (必填, 或用 --agent 从 tokens.env 读取)
   --agent <slug> 从 tokens.env 自动取 token (本机开发用)
 
@@ -25,7 +25,7 @@ import sys
 import urllib.error
 import urllib.request
 
-DEFAULT_URL = os.environ.get("A2A_URL", "http://127.0.0.1:3010")
+DEFAULT_URL = os.environ.get("A2A_URL", "http://100.68.80.91:3010")
 TOKENS_FILE = os.path.expanduser("~/projects/a2a-bus/tokens.env")
 
 
@@ -75,7 +75,7 @@ def req(base, path, token, method="GET", body=None, timeout=30):
             err = {"detail": str(e)}
         return e.code, err
     except (urllib.error.URLError, OSError, TimeoutError) as e:
-        hint = "（本机没有 a2a 服务？用 --url http://100.68.80.91:3010 或设 A2A_URL 指向 Oracle 节点）" if "127.0.0.1" in base else ""
+        hint = "（无法连接 a2a 服务 — 检查 Tailscale 是否连通 (tailscale status)，或节点 a2a-api 是否在跑）"
         sys.exit(f"ERROR: 无法连接 {base} — {e} {hint}")
 
 
