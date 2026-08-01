@@ -9,6 +9,7 @@
   a2a status <id> <status>
   a2a watch [--json]            # SSE 实时监听新消息
   a2a meet <topic> [--tail N] [--leave]  # 房间交互开会 (实时收发, /leave 或 Ctrl-C 退出)
+  a2a ask <to> <问题...> [--timeout N]  # 提问挂起等回复 (reply_to 匹配), 默认超时 600s
   a2a contacts
   a2a presence               # 各 agent 在线状态
   a2a health
@@ -280,6 +281,40 @@ def cmd_meet(args, base, tok):
         stop.set()
 
 
+def cmd_ask(args, base, tok):
+    """ask <to> <问题> [--timeout N] (T12): 发消息并挂起等回复 (reply_to 匹配原消息),
+    收到即打印返回; 超时提示退出。"""
+    to = args.to
+    question = " ".join(args.question)
+    timeout = args.timeout or 600
+    code, d = req(base, "/api/send", tok, "POST",
+                  {"to": to, "subject": question[:80] or "ask", "body": question,
+                   "msg_id": str(uuid.uuid4())})
+    if code != 200:
+        sys.exit(f"ERROR {code}: {d}")
+    sent_id = d["id"]
+    print(f"❓ 已问 #{sent_id} → {to}: {question}", file=sys.stderr)
+    deadline = time.time() + timeout
+    last = sent_id
+    while time.time() < deadline:
+        try:
+            code, d = req(base, f"/api/inbox/me?since={last}&limit=50", tok)
+            if code == 200:
+                for m in d["messages"]:
+                    last = max(last, m["id"])
+                    if m.get("from") == to and m.get("reply_to") == sent_id:
+                        reply = m.get("body") or m.get("subject") or ""
+                        print(f"💬 {m['from']} 回复 #{m['id']}: {reply}")
+                        return
+        except SystemExit:
+            pass
+        except Exception:
+            pass
+        time.sleep(1.5)
+    print(f"⏰ 等待 {timeout}s 未收到 {to} 的回复, 已超时退出", file=sys.stderr)
+    sys.exit(1)
+
+
 def cmd_contacts(args, base, tok):
     code, d = req(base, "/api/contacts", tok)
     if code != 200:
@@ -359,6 +394,11 @@ def main():
     sp.add_argument("--tail", type=int, default=0, help="加入时拉最近 N 条历史")
     sp.add_argument("--leave", action="store_true", help="拉取历史后退出 (非交互)")
 
+    sp = sub.add_parser("ask", help="提问挂起等回复 (T12)")
+    sp.add_argument("to")
+    sp.add_argument("question", nargs="+", help="问题内容 (可多词)")
+    sp.add_argument("--timeout", type=int, default=600, help="超时秒数, 默认 600 (10m)")
+
     sp = sub.add_parser("contacts", help="Agent 列表")
     sp = sub.add_parser("presence", help="各 agent 在线状态")
     sp = sub.add_parser("health", help="健康检查")
@@ -382,6 +422,8 @@ def main():
         cmd_watch(args, base, tok)
     elif args.cmd == "meet":
         cmd_meet(args, base, tok)
+    elif args.cmd == "ask":
+        cmd_ask(args, base, tok)
     elif args.cmd == "contacts":
         cmd_contacts(args, base, tok)
     elif args.cmd == "presence":
