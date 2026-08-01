@@ -191,6 +191,16 @@ def cmd_health(args, base, tok):
     print(f"✅ 总线健康: stream={d['stream']} 消息={d['messages']} last_seq={d['last_seq']}")
 
 
+def cmd_whoami(args, base, tok):
+    """验证当前 token 绑定的身份。返回的 slug 应等于你自己的 slug，否则 token 配错了。"""
+    code, d = req(base, "/api/whoami", tok)
+    if code != 200:
+        sys.exit(f"ERROR {code}: {d}")
+    print(f"当前 token 身份: {d['agent']}")
+    if args.agent and d["agent"] != args.agent:
+        sys.exit(f"⚠️ 不匹配! --agent={args.agent} 但 token 实际身份是 {d['agent']} — token 配错了")
+
+
 def main():
     p = argparse.ArgumentParser(description="a2a — 跨 Agent 消息 CLI")
     p.add_argument("--agent", help="agent slug (从 tokens.env 取 token)")
@@ -227,6 +237,7 @@ def main():
 
     sp = sub.add_parser("contacts", help="Agent 列表")
     sp = sub.add_parser("health", help="健康检查")
+    sp = sub.add_parser("whoami", help="验证当前 token 绑定的身份 (自查 token 是否配错)")
 
     args = p.parse_args()
     base, tok = resolve_token(args)
@@ -248,6 +259,8 @@ def main():
         cmd_contacts(args, base, tok)
     elif args.cmd == "health":
         cmd_health(args, base, tok)
+    elif args.cmd == "whoami":
+        cmd_whoami(args, base, tok)
 
 
 if __name__ == "__main__":
