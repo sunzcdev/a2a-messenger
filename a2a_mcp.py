@@ -128,5 +128,5 @@ def a2a_health() -> str:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="http", host="127.0.0.1",
+    mcp.run(transport="http", host=os.environ.get("A2A_MCP_HOST", "127.0.0.1"),
             port=int(os.environ.get("A2A_MCP_PORT", "3011")))
