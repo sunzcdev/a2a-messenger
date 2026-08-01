@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""a2a-bus API — 跨 Agent 消息桥 (NATS JetStream + FastAPI)
+
+推: GET /api/events (SSE 长连接, durable consumer, 未 ack 重投)
+拉: GET /api/inbox/<agent> (ephemeral 查询, 永远看到全部消息)
+发: POST /api/send (publish → a2a.<to>.inbox, KV 记 status)
+状态: POST /api/status/<seq>
+
+认证: Bearer token, 每个 token 绑定一个 agent slug (A2A_TOKENS env)。
+      from 由 token 决定, 不可伪造; 只能读写自己的收件箱。
+"""
+import asyncio
+import json
+import os
+import re
+import time
+from contextlib import asynccontextmanager
+
+import nats
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import StreamingResponse
+from nats.js.api import DeliverPolicy, RetentionPolicy, StreamConfig
+from pydantic import BaseModel
+
+NATS_URL = os.environ.get("A2A_NATS_URL", "nats://127.0.0.1:4222")
+STREAM = "A2A"
+KV_BUCKET = "a2a-status"
+PORT = int(os.environ.get("A2A_API_PORT", "3010"))
+
+# A2A_TOKENS="octopus:tok1,hermes:tok2,..." → token → agent slug
+_TOKEN2AGENT = {}
+for pair in os.environ.get("A2A_TOKENS", "").split(","):
+    if ":" in pair:
+        agent, tok = pair.strip().split(":", 1)
+        _TOKEN2AGENT[tok.strip()] = agent.strip()
+
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+VALID_STATUS = ("unread", "read", "replied", "archived", "recalled")
+
+nc = None
+js = None
+kv = None
+_subs: dict[str, object] = {}          # agent -> push subscription
+_queues: dict[str, asyncio.Queue] = {}  # agent -> SSE 分发队列
+
+
+def check_slug(s: str):
+    if not SLUG_RE.match(s):
+        raise HTTPException(400, f"invalid agent slug: {s!r}")
+
+
+def require_agent(auth: str | None) -> str:
+    if not auth or not auth.startswith("Bearer "):
+        raise HTTPException(401, "missing bearer token")
+    agent = _TOKEN2AGENT.get(auth[7:].strip())
+    if not agent:
+        raise HTTPException(403, "unknown token")
+    return agent
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    global nc, js, kv
+    nc = await nats.connect(NATS_URL)
+    js = nc.jetstream()
+    try:
+        kv = await js.key_value(bucket=KV_BUCKET)
+    except Exception:
+        kv = await js.create_key_value(bucket=KV_BUCKET)
+    try:
+        await js.stream_info(STREAM)
+    except Exception:
+        await js.add_stream(StreamConfig(
+            name=STREAM,
+            subjects=["a2a.*.inbox"],
+            retention=RetentionPolicy.LIMITS,
+            max_age=90 * 24 * 3600,
+            max_msgs=1_000_000,
+        ))
+    yield
+    if nc:
+        await nc.drain()
+
+
+app = FastAPI(title="a2a-bus", lifespan=lifespan)
+
+
+class SendReq(BaseModel):
+    to: str
+    subject: str
+    body: str = ""
+    reply_to: int | None = None
+    thread: str | None = None
+
+
+@app.post("/api/send")
+async def send(req: SendReq, authorization: str | None = Header(default=None)):
+    me = require_agent(authorization)
+    check_slug(req.to)
+    if not req.subject.strip():
+        raise HTTPException(400, "subject required")
+    msg = {
+        "from": me,
+        "to": req.to,
+        "subject": req.subject.strip(),
+        "body": req.body,
+        "reply_to": req.reply_to,
+        "thread": req.thread,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    ack = await js.publish(f"a2a.{req.to}.inbox", json.dumps(msg).encode())
+    seq = ack.seq
+    await kv.put(str(seq), b"unread")
+    return {"id": seq, "status": "unread", "to": req.to}
+
+
+def _msg_item(seq: int, data: dict, status: str) -> dict:
+    return {
+        "id": seq,
+        "from": data.get("from"),
+        "to": data.get("to"),
+        "subject": data.get("subject"),
+        "body": data.get("body"),
+        "reply_to": data.get("reply_to"),
+        "thread": data.get("thread"),
+        "created": data.get("created"),
+        "status": status,
+    }
+
+
+async def _kv_status(seq: int) -> str:
+    try:
+        e = await kv.get(str(seq))
+        return e.value.decode()
+    except Exception:
+        return "unread"
+
+
+@app.get("/api/inbox/{agent}")
+async def inbox(agent: str, authorization: str | None = Header(default=None),
+                since: int | None = None, limit: int = 200, unread_only: bool = False):
+    me = require_agent(authorization)
+    if agent == "me":
+        agent = me
+    if agent != me:
+        raise HTTPException(403, "can only read own inbox")
+    check_slug(agent)
+    sub = await js.pull_subscribe(f"a2a.{agent}.inbox")
+    try:
+        try:
+            msgs = await sub.fetch(limit, timeout=3)
+        except Exception:
+            msgs = []
+    finally:
+        await sub.unsubscribe()
+    items = []
+    for m in msgs:
+        try:
+            data = json.loads(m.data)
+        except Exception:
+            continue
+        seq = m.metadata.sequence.stream
+        if since is not None and seq <= since:
+            continue
+        st = await _kv_status(seq)
+        if unread_only and st != "unread":
+            continue
+        items.append(_msg_item(seq, data, st))
+    items.sort(key=lambda x: x["id"])
+    return {"agent": agent, "count": len(items), "messages": items}
+
+
+async def _pump(agent: str, sub):
+    try:
+        async for m in sub.messages:
+            try:
+                data = json.loads(m.data)
+                await m.ack()
+                seq = m.metadata.sequence.stream
+                item = _msg_item(seq, data, "unread")
+                q = _queues.get(agent)
+                if q:
+                    try:
+                        q.put_nowait(item)
+                    except asyncio.QueueFull:
+                        pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+@app.get("/api/events")
+async def events(authorization: str | None = Header(default=None)):
+    me = require_agent(authorization)
+    check_slug(me)
+    if me not in _subs:
+        sub = await js.subscribe(
+            f"a2a.{me}.inbox",
+            durable=f"sse-{me}",
+            deliver_policy=DeliverPolicy.NEW,
+            manual_ack=True,
+        )
+        _subs[me] = sub
+        asyncio.create_task(_pump(me, sub))
+
+    q = asyncio.Queue(maxsize=200)
+    old = _queues.get(me)
+    _queues[me] = q
+
+    async def gen():
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(q.get(), timeout=15)
+                    yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            if _queues.get(me) is q:
+                _queues.pop(me, None)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+class StatusReq(BaseModel):
+    status: str
+
+
+@app.post("/api/status/{seq}")
+async def set_status(seq: int, req: StatusReq,
+                     authorization: str | None = Header(default=None)):
+    me = require_agent(authorization)
+    if req.status not in VALID_STATUS:
+        raise HTTPException(400, f"invalid status, use one of {VALID_STATUS}")
+    try:
+        m = await js.get_msg(STREAM, seq)
+    except Exception:
+        raise HTTPException(404, "message not found")
+    data = json.loads(m.data)
+    if data.get("to") != me:
+        raise HTTPException(403, "not your message")
+    await kv.put(str(seq), req.status.encode())
+    return {"id": seq, "status": req.status}
+
+
+@app.get("/api/whoami")
+async def whoami(authorization: str | None = Header(default=None)):
+    return {"agent": require_agent(authorization)}
+
+
+@app.get("/api/contacts")
+async def contacts():
+    return {"agents": sorted(set(_TOKEN2AGENT.values()))}
+
+
+@app.get("/api/health")
+async def health():
+    si = await js.stream_info(STREAM)
+    return {"ok": True, "stream": STREAM,
+            "messages": si.state.messages, "last_seq": si.state.last_seq}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

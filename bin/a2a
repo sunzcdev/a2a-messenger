@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""a2a — 跨 Agent 消息 CLI (NATS JetStream 总线)
+
+用法:
+  a2a inbox [--unread] [--since N] [--limit N] [--json]
+  a2a send <to> <subject> <body>
+  a2a reply <id> <body>
+  a2a mark-read <id>
+  a2a status <id> <status>
+  a2a watch [--json]            # SSE 实时监听新消息
+  a2a contacts
+  a2a health
+
+配置 (环境变量):
+  A2A_URL   默认 http://127.0.0.1:3010
+  A2A_TOKEN 本 agent 的 Bearer token (必填, 或用 --agent 从 tokens.env 读取)
+  --agent <slug> 从 tokens.env 自动取 token (本机开发用)
+
+纯 stdlib, 任何机器 python3 直接跑。
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+DEFAULT_URL = os.environ.get("A2A_URL", "http://127.0.0.1:3010")
+TOKENS_FILE = os.path.expanduser("~/projects/a2a-bus/tokens.env")
+
+
+def load_tokens():
+    tok = {}
+    try:
+        for line in open(TOKENS_FILE):
+            if line.startswith("A2A_TOKENS="):
+                for p in line.split("=", 1)[1].split(","):
+                    a, t = p.strip().split(":", 1)
+                    tok[a] = t
+    except OSError:
+        pass
+    return tok
+
+
+def resolve_token(args) -> tuple[str, str]:
+    """返回 (base_url, token)。--agent 优先, 其次 A2A_TOKEN env。"""
+    tok = None
+    if args.agent:
+        tok = load_tokens().get(args.agent)
+        if not tok:
+            sys.exit(f"ERROR: 未在 tokens.env 找到 agent {args.agent!r}")
+    else:
+        tok = os.environ.get("A2A_TOKEN")
+        if not tok:
+            sys.exit("ERROR: 需要 A2A_TOKEN 环境变量或 --agent <slug>")
+    return args.url or DEFAULT_URL, tok
+
+
+def req(base, path, token, method="GET", body=None, timeout=30):
+    r = urllib.request.Request(base + path, method=method)
+    r.add_header("Authorization", f"Bearer {token}")
+    r.add_header("User-Agent", "a2a-cli")
+    if body is not None:
+        r.add_header("Content-Type", "application/json")
+        r.data = json.dumps(body, ensure_ascii=False).encode()
+    try:
+        with urllib.request.urlopen(r, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read().decode())
+        except Exception:
+            err = {"detail": str(e)}
+        return e.code, err
+
+
+def fmt_msg(m) -> str:
+    st = m["status"]
+    flag = {"unread": "🆕", "read": "📖", "replied": "↩️", "archived": "🗄️", "recalled": "🚫"}.get(st, st)
+    head = f"  #{m['id']} {flag} {m['from']} → {m['to']}  [{m['created']}] {m['subject']}"
+    body = m.get("body") or ""
+    lines = [head]
+    if body:
+        lines.append("      " + body.replace("\n", "\n      "))
+    if m.get("reply_to"):
+        lines.append(f"      (回复 #{m['reply_to']})")
+    return "\n".join(lines)
+
+
+def cmd_inbox(args, base, tok):
+    path = f"/api/inbox/{args.agent}" if args.agent else "/api/inbox/me"
+    params = []
+    if args.unread:
+        params.append("unread_only=true")
+    if args.since is not None:
+        params.append(f"since={args.since}")
+    if args.limit:
+        params.append(f"limit={args.limit}")
+    if params:
+        path += "?" + "&".join(params)
+    code, d = req(base, path, tok)
+    if code != 200:
+        sys.exit(f"ERROR {code}: {d}")
+    if args.json:
+        print(json.dumps(d, ensure_ascii=False, indent=2))
+        return
+    msgs = d["messages"]
+    print(f"收件箱 {d['agent']}: {d['count']} 条")
+    for m in msgs:
+        print(fmt_msg(m))
+        print()
+
+
+def cmd_send(args, base, tok):
+    body = args.body or ""
+    payload = {"to": args.to, "subject": args.subject, "body": body}
+    if args.reply_to:
+        payload["reply_to"] = args.reply_to
+    code, d = req(base, "/api/send", tok, "POST", payload)
+    if code != 200:
+        sys.exit(f"ERROR {code}: {d}")
+    print(f"✅ 已发送 #{d['id']} → {d['to']} [{d['status']}]")
+
+
+def cmd_reply(args, base, tok):
+    payload = {"to": args.to, "subject": args.subject, "body": args.body, "reply_to": args.id}
+    code, d = req(base, "/api/send", tok, "POST", payload)
+    if code != 200:
+        sys.exit(f"ERROR {code}: {d}")
+    code2, d2 = req(base, f"/api/status/{args.id}", tok, "POST", {"status": "replied"})
+    if code2 != 200:
+        sys.exit(f"ERROR 标原消息 replied 失败 {code2}: {d2}")
+    print(f"✅ 已回复 #{args.id} (新消息 #{d['id']})，原消息已标 replied")
+
+
+def cmd_status(args, base, tok):
+    if args.status not in ("unread", "read", "replied", "archived", "recalled"):
+        sys.exit(f"ERROR: 非法状态 {args.status}")
+    code, d = req(base, f"/api/status/{args.id}", tok, "POST", {"status": args.status})
+    if code != 200:
+        sys.exit(f"ERROR {code}: {d}")
+    print(f"✅ #{d['id']} → {d['status']}")
+
+
+def cmd_watch(args, base, tok):
+    import urllib.request as u
+    r = u.Request(base + "/api/events")
+    r.add_header("Authorization", f"Bearer {tok}")
+    try:
+        resp = u.urlopen(r, timeout=None)
+    except Exception as e:
+        sys.exit(f"ERROR 连接 SSE: {e}")
+    print("监听中... (Ctrl-C 退出)", file=sys.stderr)
+    buf = b""
+    try:
+        while True:
+            chunk = resp.read(1)
+            if not chunk:
+                break
+            if chunk == b"\n":
+                if buf.startswith(b"data: "):
+                    item = json.loads(buf[6:].decode())
+                    if args.json:
+                        print(json.dumps(item, ensure_ascii=False))
+                    else:
+                        print(fmt_msg(item), flush=True)
+                buf = b""
+            else:
+                buf += chunk
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_contacts(args, base, tok):
+    code, d = req(base, "/api/contacts", tok)
+    if code != 200:
+        sys.exit(f"ERROR {code}: {d}")
+    print("Agent 注册表:", ", ".join(d["agents"]))
+
+
+def cmd_health(args, base, tok):
+    code, d = req(base, "/api/health", tok)
+    if code != 200:
+        sys.exit(f"ERROR {code}: {d}")
+    print(f"✅ 总线健康: stream={d['stream']} 消息={d['messages']} last_seq={d['last_seq']}")
+
+
+def main():
+    p = argparse.ArgumentParser(description="a2a — 跨 Agent 消息 CLI")
+    p.add_argument("--agent", help="agent slug (从 tokens.env 取 token)")
+    p.add_argument("--url", default=os.environ.get("A2A_URL", DEFAULT_URL), help="API base URL")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("inbox", help="拉收件箱")
+    sp.add_argument("--unread", action="store_true")
+    sp.add_argument("--since", type=int)
+    sp.add_argument("--limit", type=int, default=200)
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser("send", help="发消息")
+    sp.add_argument("to")
+    sp.add_argument("subject")
+    sp.add_argument("body", nargs="?", default="")
+    sp.add_argument("--reply-to", type=int)
+
+    sp = sub.add_parser("reply", help="回复消息并标 replied")
+    sp.add_argument("id", type=int)
+    sp.add_argument("to", help="收件人 slug")
+    sp.add_argument("subject")
+    sp.add_argument("body", nargs="?", default="")
+
+    sp = sub.add_parser("status", help="改消息状态")
+    sp.add_argument("id", type=int)
+    sp.add_argument("status")
+
+    sp = sub.add_parser("mark-read", help="标已读")
+    sp.add_argument("id", type=int)
+
+    sp = sub.add_parser("watch", help="SSE 实时监听")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser("contacts", help="Agent 列表")
+    sp = sub.add_parser("health", help="健康检查")
+
+    args = p.parse_args()
+    base, tok = resolve_token(args)
+
+    if args.cmd == "inbox":
+        cmd_inbox(args, base, tok)
+    elif args.cmd == "send":
+        cmd_send(args, base, tok)
+    elif args.cmd == "reply":
+        cmd_reply(args, base, tok)
+    elif args.cmd == "status":
+        cmd_status(args, base, tok)
+    elif args.cmd == "mark-read":
+        args.status = "read"
+        cmd_status(args, base, tok)
+    elif args.cmd == "watch":
+        cmd_watch(args, base, tok)
+    elif args.cmd == "contacts":
+        cmd_contacts(args, base, tok)
+    elif args.cmd == "health":
+        cmd_health(args, base, tok)
+
+
+if __name__ == "__main__":
+    main()
