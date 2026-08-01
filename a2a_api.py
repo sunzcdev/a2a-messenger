@@ -15,6 +15,7 @@ import json
 import os
 import re
 import time
+import uuid
 from contextlib import asynccontextmanager
 
 from datetime import datetime, timezone
@@ -134,12 +135,16 @@ async def send(req: SendReq, authorization: str | None = Header(default=None)):
         "thread": req.thread,
         "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-    # 幂等: 有 msg_id 时加 Nats-Msg-Id header, stream DuplicateWindow(2m) 内同 id 只存一条
-    hdrs = {"Nats-Msg-Id": req.msg_id} if req.msg_id else None
     # 扇出到各收件人 (各自独立 seq + 状态); 复用 notice 逻辑, 支持多收件人
+    # ⚠️ Nats-Msg-Id 去重是 stream 级而非 subject 级: 同 msg_id 扇出多个 subject,
+    # 后续副本会被 DuplicateWindow 吞掉 (T7 返修实锤)。每个收件人派生独立
+    # Nats-Msg-Id: 有 msg_id → f"{msg_id}:{t}" (同收件人重试仍去重, T6 语义保留);
+    # 无 msg_id → 每副本独立 uuid。
     seqs = []
     for t in targets:
-        ack = await js.publish(f"a2a.{t}.inbox", json.dumps(msg).encode(), headers=hdrs)
+        per_msg_id = f"{req.msg_id}:{t}" if req.msg_id else str(uuid.uuid4())
+        ack = await js.publish(f"a2a.{t}.inbox", json.dumps(msg).encode(),
+                               headers={"Nats-Msg-Id": per_msg_id})
         await kv.put(str(ack.seq), b"unread")
         seqs.append(ack.seq)
     if raw_to == NOTICE:
