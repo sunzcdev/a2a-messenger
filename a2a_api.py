@@ -167,14 +167,26 @@ async def inbox(agent: str, authorization: str | None = Header(default=None),
     if agent != me:
         raise HTTPException(403, "can only read own inbox")
     check_slug(agent)
-    # 多拉一点再截断，保证「无 since = 最新 limit 条」的语义 (fetch 只从旧到新)
-    fetch_n = max(limit, 1000)
+    # 循环 fetch 直到拉完: fetch 从最旧开始, 收件箱 > 批量时单次会被截断,
+    # 不拉完就取不到最新 limit 条。JetStream pull consumer 默认 max_ack_pending=1000
+    # 限制单次投递量, 故: a) 批量固定 1000 (≤ 配额, server 能足额投递, "返回数<批量"
+    # 即为拉完); b) 每批收齐后立即 ack 释放配额, 才能拉下一批。consumer 为本次查询
+    # 临时创建、用完即删, ack 无副作用 (unread 状态在 KV, 与 ack 无关)。
+    fetch_n = 1000
     sub = await js.pull_subscribe(f"a2a.{agent}.inbox")
     try:
-        try:
-            msgs = await sub.fetch(fetch_n, timeout=3)
-        except Exception:
-            msgs = []
+        msgs = []
+        while True:
+            try:
+                batch = await sub.fetch(fetch_n, timeout=3)
+            except Exception:
+                batch = []
+            if not batch:
+                break
+            msgs.extend(batch)
+            await asyncio.gather(*(m.ack() for m in batch))
+            if len(batch) < fetch_n:
+                break
     finally:
         await sub.unsubscribe()
     items = []
