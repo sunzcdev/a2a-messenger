@@ -36,6 +36,7 @@ for pair in os.environ.get("A2A_TOKENS", "").split(","):
 
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 VALID_STATUS = ("unread", "read", "replied", "archived", "recalled")
+NOTICE = "notice"  # 全网通知地址: to=notice → 广播给所有注册 agent
 
 nc = None
 js = None
@@ -108,6 +109,16 @@ async def send(req: SendReq, authorization: str | None = Header(default=None)):
         "thread": req.thread,
         "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    # 全网通知: to=notice → 扇出复制到每个注册 agent 的收件箱 (各自独立 seq + 状态)
+    if req.to == NOTICE:
+        targets = sorted(set(_TOKEN2AGENT.values()))
+        seqs = []
+        for t in targets:
+            ack = await js.publish(f"a2a.{t}.inbox", json.dumps(msg).encode())
+            await kv.put(str(ack.seq), b"unread")
+            seqs.append(ack.seq)
+        return {"id": seqs[0], "status": "unread", "to": req.to,
+                "broadcast_to": targets, "seqs": seqs}
     ack = await js.publish(f"a2a.{req.to}.inbox", json.dumps(msg).encode())
     seq = ack.seq
     await kv.put(str(seq), b"unread")
@@ -145,10 +156,12 @@ async def inbox(agent: str, authorization: str | None = Header(default=None),
     if agent != me:
         raise HTTPException(403, "can only read own inbox")
     check_slug(agent)
+    # 多拉一点再截断，保证「无 since = 最新 limit 条」的语义 (fetch 只从旧到新)
+    fetch_n = max(limit, 1000)
     sub = await js.pull_subscribe(f"a2a.{agent}.inbox")
     try:
         try:
-            msgs = await sub.fetch(limit, timeout=3)
+            msgs = await sub.fetch(fetch_n, timeout=3)
         except Exception:
             msgs = []
     finally:
@@ -160,13 +173,15 @@ async def inbox(agent: str, authorization: str | None = Header(default=None),
         except Exception:
             continue
         seq = m.metadata.sequence.stream
-        if since is not None and seq <= since:
-            continue
         st = await _kv_status(seq)
         if unread_only and st != "unread":
             continue
         items.append(_msg_item(seq, data, st))
     items.sort(key=lambda x: x["id"])
+    if since is not None:
+        items = [it for it in items if it["id"] > since]
+    else:
+        items = items[-limit:]  # 无 since → 最新 limit 条
     return {"agent": agent, "count": len(items), "messages": items}
 
 
@@ -253,7 +268,10 @@ async def whoami(authorization: str | None = Header(default=None)):
 
 @app.get("/api/contacts")
 async def contacts():
-    return {"agents": sorted(set(_TOKEN2AGENT.values()))}
+    return {
+        "agents": sorted(set(_TOKEN2AGENT.values())),
+        "notice": "全网通知地址: to=notice 会广播给所有 agent (from 保留发送者, 各收件箱独立)",
+    }
 
 
 @app.get("/api/health")

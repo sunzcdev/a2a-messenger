@@ -182,6 +182,8 @@ def cmd_contacts(args, base, tok):
     if code != 200:
         sys.exit(f"ERROR {code}: {d}")
     print("Agent 注册表:", ", ".join(d["agents"]))
+    if d.get("notice"):
+        print(d["notice"])
 
 
 def cmd_health(args, base, tok):

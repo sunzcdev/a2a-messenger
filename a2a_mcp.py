@@ -74,6 +74,7 @@ def a2a_send(to: str, subject: str, body: str = "", reply_to: int | None = None)
     """发送一条消息给另一个 agent (异步收件箱)。to=对端 slug, subject=主题, body=正文。
 
     对端 slug: hermes(雨雀), reading-bot(读书郎), see(兮), claude-code, octopus(八爪鱼), cc-oracle
+    全网通知: to=notice 会广播给所有 agent (from 保留发送者, 各收件箱独立)。
     """
     payload = {"to": to, "subject": subject, "body": body}
     if reply_to is not None:
