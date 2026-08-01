@@ -111,6 +111,12 @@ class SendReq(BaseModel):
     msg_id: str | None = None   # 幂等键: 同 msg_id 在 DuplicateWindow(2m) 内只存一条
 
 
+class VoteReq(BaseModel):
+    topic: str
+    proposal: str
+    option: str = "赞成"
+
+
 @app.post("/api/send")
 async def send(req: SendReq, authorization: str | None = Header(default=None)):
     me = require_agent(authorization)
@@ -393,6 +399,74 @@ async def set_status(seq: int, req: StatusReq,
         raise HTTPException(403, "not your message")
     await kv.put(str(seq), req.status.encode())
     return {"id": seq, "status": req.status}
+
+
+@app.post("/api/vote")
+async def vote(req: VoteReq, authorization: str | None = Header(default=None)):
+    """投票 (T13): 每 agent 对 (topic, proposal) 投一票, KV 计数, 重复投票拒绝。
+    KV key 不允许冒号, 用点分隔: vote.<topic>.<proposal> / .agent.<agent>; unicode 提案绕过客户端校验。"""
+    me = require_agent(authorization)
+    topic = req.topic.strip()
+    proposal = re.sub(r"[*>]", "_", req.proposal.strip())[:64]
+    option = req.option.strip() or "赞成"
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", topic):
+        raise HTTPException(400, f"invalid vote topic: {topic!r}")
+    if not proposal:
+        raise HTTPException(400, "proposal required")
+    prefix = f"vote.{topic}.{proposal}"
+    voter_key = f"{prefix}.agent.{me}"
+    count_key = prefix
+    try:
+        await kv.get(voter_key, validate_keys=False)
+        raise HTTPException(400, "已投过票, 不能重复投票")
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # 未投过
+    # CAS 递增计数 (并发安全)
+    new_count = 1
+    for _ in range(8):
+        try:
+            e = await kv.get(count_key, validate_keys=False)
+            cur = int(e.value.decode())
+            rev = e.revision
+        except Exception:
+            cur, rev = 0, 0
+        new_count = cur + 1
+        try:
+            if rev:
+                await kv.update(count_key, str(new_count).encode(), rev, validate_keys=False)
+            else:
+                await kv.create(count_key, str(new_count).encode(), validate_keys=False)
+            break
+        except Exception:
+            continue
+    await kv.put(voter_key, option.encode(), validate_keys=False)
+    return {"topic": topic, "proposal": req.proposal.strip(), "voter": me,
+            "option": option, "count": new_count}
+
+
+@app.get("/api/vote")
+async def vote_status(topic: str, proposal: str,
+                      authorization: str | None = Header(default=None)):
+    """查看 (topic, proposal) 的投票计数与投票人 (T13)。"""
+    require_agent(authorization)
+    proposal_safe = re.sub(r"[*>]", "_", proposal.strip())[:64]
+    prefix = f"vote.{topic.strip()}.{proposal_safe}"
+    count = 0
+    try:
+        e = await kv.get(prefix, validate_keys=False)
+        count = int(e.value.decode())
+    except Exception:
+        pass
+    voters = []
+    try:
+        for k in await kv.keys(filters=[f"{prefix}.agent."]):
+            voters.append(k.split(".agent.")[-1])
+    except Exception:
+        pass
+    return {"topic": topic.strip(), "proposal": proposal.strip(),
+            "count": count, "voters": sorted(voters)}
 
 
 @app.get("/api/whoami")

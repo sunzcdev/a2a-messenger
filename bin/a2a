@@ -8,8 +8,10 @@
   a2a mark-read <id>
   a2a status <id> <status>
   a2a watch [--json]            # SSE 实时监听新消息
-  a2a meet <topic> [--tail N] [--leave]  # 房间交互开会 (实时收发, /leave 或 Ctrl-C 退出)
+  a2a meet <topic> [--tail N] [--leave] [--minutes]  # 房间交互 / 导出会议纪要
   a2a ask <to> <问题...> [--timeout N]  # 提问挂起等回复 (reply_to 匹配), 默认超时 600s
+  a2a vote <topic> <proposal> [option]  # 投票 (每 agent 一票)
+  a2a votes <topic> <proposal>          # 查看投票
   a2a contacts
   a2a presence               # 各 agent 在线状态
   a2a health
@@ -29,6 +31,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -233,6 +236,28 @@ def cmd_meet(args, base, tok):
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", topic):
         sys.exit(f"ERROR: 非法房间 topic: {topic!r}")
     room = f"room:{topic}"
+    # --minutes: 导出会议纪要 markdown 到本地文件后退出 (T13)
+    if args.minutes:
+        code, d = req(base, f"/api/inbox/{room}?limit=500", tok)
+        if code != 200:
+            sys.exit(f"ERROR {code}: {d}")
+        lines = [f"# 会议纪要: {topic}", ""]
+        senders = sorted({m["from"] for m in d["messages"]})
+        lines.append(f"- 房间: `{room}`")
+        lines.append(f"- 发言人: {', '.join(senders) if senders else '(无)'}")
+        lines.append(f"- 消息数: {d['count']}")
+        lines.append("")
+        lines.append("## 记录")
+        lines.append("")
+        for m in d["messages"]:
+            ts = (m.get("created") or "")[:19]
+            body = (m.get("body") or "").replace("\n", " ")
+            lines.append(f"- **{ts}** {m['from']}: {body}")
+        fname = f"minutes-{topic}-{time.strftime('%Y%m%d-%H%M%S')}.md"
+        with open(fname, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"✅ 会议纪要已导出: {os.path.abspath(fname)} ({d['count']} 条消息)")
+        return
     state = {"last_id": 0}
     # 加入时拉最近 N 条历史 (迟到补课)
     if args.tail:
@@ -315,6 +340,27 @@ def cmd_ask(args, base, tok):
     sys.exit(1)
 
 
+def cmd_vote(args, base, tok):
+    """vote <topic> <proposal> [option] (T13): 投票 (每 agent 对每个 proposal 一票)"""
+    option = args.option or "赞成"
+    code, d = req(base, "/api/vote", tok, "POST",
+                  {"topic": args.topic, "proposal": args.proposal, "option": option})
+    if code != 200:
+        sys.exit(f"ERROR {code}: {d}")
+    print(f"🗳️ 已投票 [{d['voter']}] {d['proposal']} = {d['option']} (当前 {d['count']} 票)")
+
+
+def cmd_votes(args, base, tok):
+    """votes <topic> <proposal> (T13): 查看投票计数与投票人"""
+    code, d = req(base, f"/api/vote?topic={urllib.parse.quote(args.topic)}"
+                        f"&proposal={urllib.parse.quote(args.proposal)}", tok)
+    if code != 200:
+        sys.exit(f"ERROR {code}: {d}")
+    print(f"🗳️ [{d['topic']}] {d['proposal']}: {d['count']} 票")
+    for v in d.get("voters", []):
+        print(f"  - {v}")
+
+
 def cmd_contacts(args, base, tok):
     code, d = req(base, "/api/contacts", tok)
     if code != 200:
@@ -393,11 +439,20 @@ def main():
     sp.add_argument("topic")
     sp.add_argument("--tail", type=int, default=0, help="加入时拉最近 N 条历史")
     sp.add_argument("--leave", action="store_true", help="拉取历史后退出 (非交互)")
+    sp.add_argument("--minutes", action="store_true", help="导出会议纪要 markdown 后退出 (T13)")
 
     sp = sub.add_parser("ask", help="提问挂起等回复 (T12)")
     sp.add_argument("to")
     sp.add_argument("question", nargs="+", help="问题内容 (可多词)")
     sp.add_argument("--timeout", type=int, default=600, help="超时秒数, 默认 600 (10m)")
+
+    sp = sub.add_parser("vote", help="投票 (T13)")
+    sp.add_argument("topic")
+    sp.add_argument("proposal")
+    sp.add_argument("option", nargs="?", default="赞成", help="选项 (默认赞成)")
+    sp = sub.add_parser("votes", help="查看投票 (T13)")
+    sp.add_argument("topic")
+    sp.add_argument("proposal")
 
     sp = sub.add_parser("contacts", help="Agent 列表")
     sp = sub.add_parser("presence", help="各 agent 在线状态")
@@ -424,6 +479,10 @@ def main():
         cmd_meet(args, base, tok)
     elif args.cmd == "ask":
         cmd_ask(args, base, tok)
+    elif args.cmd == "vote":
+        cmd_vote(args, base, tok)
+    elif args.cmd == "votes":
+        cmd_votes(args, base, tok)
     elif args.cmd == "contacts":
         cmd_contacts(args, base, tok)
     elif args.cmd == "presence":
