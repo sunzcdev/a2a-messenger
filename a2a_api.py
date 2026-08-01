@@ -10,6 +10,7 @@
       from 由 token 决定, 不可伪造; 只能读写自己的收件箱。
 """
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -45,6 +46,7 @@ js = None
 kv = None
 _subs: dict[str, object] = {}          # agent -> push subscription
 _queues: dict[str, asyncio.Queue] = {}  # agent -> SSE 分发队列
+_shutdown = asyncio.Event()            # SIGTERM/SIGINT 置位 → SSE gen 快速退出
 
 
 def check_slug(s: str):
@@ -81,6 +83,15 @@ async def lifespan(_app):
             max_msgs=1_000_000,
         ))
     yield
+    # 优雅关闭: 退订所有 SSE consumer 让 _pump 退出, 清队列
+    # (durable consumer 本体删除归 T4)
+    for sub in list(_subs.values()):
+        try:
+            await sub.unsubscribe()
+        except Exception:
+            pass
+    _subs.clear()
+    _queues.clear()
     if nc:
         await nc.drain()
 
@@ -248,12 +259,23 @@ async def events(authorization: str | None = Header(default=None)):
 
     async def gen():
         try:
-            while True:
+            while not _shutdown.is_set():
+                # 竞速: 新消息 / 关闭信号(快速退出) / 15s keepalive
+                qtask = asyncio.create_task(q.get())
+                stask = asyncio.create_task(_shutdown.wait())
                 try:
-                    item = await asyncio.wait_for(q.get(), timeout=15)
-                    yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
-                except asyncio.TimeoutError:
+                    done, pending = await asyncio.wait(
+                        {qtask, stask}, return_when=asyncio.FIRST_COMPLETED, timeout=15)
+                finally:
+                    for t in pending:
+                        t.cancel()
+                if stask in done:
+                    break  # 收到 SIGTERM/SIGINT → 结束 SSE, 让 uvicorn 优雅关闭
+                if not done:
                     yield ": keepalive\n\n"
+                    continue
+                item = qtask.result()
+                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
         finally:
             if _queues.get(me) is q:
                 _queues.pop(me, None)
@@ -306,5 +328,24 @@ async def health():
 
 
 if __name__ == "__main__":
+    import signal
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+
+    config = uvicorn.Config(app, host="0.0.0.0", port=PORT,
+                            timeout_graceful_shutdown=5)  # 安全网: 5s 内强制收尾
+    server = uvicorn.Server(config)
+
+    async def _main():
+        def _sig(sig, frame=None):
+            _shutdown.set()            # → 所有 SSE gen 快速退出
+            server.should_exit = True  # → uvicorn 优雅关闭
+
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGTERM, lambda: _sig(signal.SIGTERM))
+        loop.add_signal_handler(signal.SIGINT, lambda: _sig(signal.SIGINT))
+        await server.serve()
+
+    # 接管信号: 禁用 uvicorn 自带 handler (否则其 signal.signal 会覆盖
+    # add_signal_handler, SIGTERM 无法触发应用关闭), 由我们统一处理。
+    server.capture_signals = contextlib.nullcontext
+    asyncio.run(_main())
