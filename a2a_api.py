@@ -44,8 +44,10 @@ NOTICE = "notice"  # 全网通知地址: to=notice → 广播给所有注册 age
 nc = None
 js = None
 kv = None
-_subs: dict[str, object] = {}          # agent -> push subscription
-_queues: dict[str, asyncio.Queue] = {}  # agent -> SSE 分发队列
+_subs: dict[str, object] = {}           # agent -> push subscription
+_pump_tasks: dict[str, asyncio.Task] = {}  # agent -> SSE pump task (可取消)
+_queues: dict[str, asyncio.Queue] = {}  # agent -> SSE 分发队列 (当前连接)
+_conns: dict[str, int] = {}             # agent -> 活跃 SSE 连接数
 _shutdown = asyncio.Event()            # SIGTERM/SIGINT 置位 → SSE gen 快速退出
 
 
@@ -83,15 +85,11 @@ async def lifespan(_app):
             max_msgs=1_000_000,
         ))
     yield
-    # 优雅关闭: 退订所有 SSE consumer 让 _pump 退出, 清队列
-    # (durable consumer 本体删除归 T4)
-    for sub in list(_subs.values()):
-        try:
-            await sub.unsubscribe()
-        except Exception:
-            pass
-    _subs.clear()
+    # 优雅关闭: 回收所有 SSE sub/pump/队列, 删 durable consumer
+    for agent in list(_subs.keys()):
+        await _cleanup_agent(agent)
     _queues.clear()
+    _conns.clear()
     if nc:
         await nc.drain()
 
@@ -222,6 +220,25 @@ async def inbox(agent: str, authorization: str | None = Header(default=None),
     return {"agent": agent, "count": len(items), "messages": items}
 
 
+async def _cleanup_agent(me: str):
+    """回收本 agent 的 SSE 状态: 取消 pump、退订 sub、删 durable consumer。幂等。"""
+    _queues.pop(me, None)
+    sub = _subs.pop(me, None)
+    task = _pump_tasks.pop(me, None)
+    if task is not None and not task.done():
+        task.cancel()
+    if sub is not None:
+        try:
+            await sub.unsubscribe()
+        except Exception:
+            pass
+        try:
+            # 删 durable consumer, 防 sse-<agent> 残留 (nats-py 无 sub.delete, 用 jsm API)
+            await js._jsm.delete_consumer(STREAM, sub._consumer)
+        except Exception:
+            pass
+
+
 async def _pump(agent: str, sub):
     try:
         async for m in sub.messages:
@@ -240,6 +257,16 @@ async def _pump(agent: str, sub):
                 pass
     except Exception:
         pass
+    finally:
+        # pump 意外结束 (sub 失效/NATS 断连/被 cancel) → 回收, 防 _subs 残留
+        if _pump_tasks.get(agent) is asyncio.current_task():
+            _pump_tasks.pop(agent, None)
+        if _subs.get(agent) is sub:
+            _subs.pop(agent, None)
+            try:
+                await js._jsm.delete_consumer(STREAM, sub._consumer)
+            except Exception:
+                pass
 
 
 @app.get("/api/events")
@@ -254,10 +281,10 @@ async def events(authorization: str | None = Header(default=None)):
             manual_ack=True,
         )
         _subs[me] = sub
-        asyncio.create_task(_pump(me, sub))
+        _pump_tasks[me] = asyncio.create_task(_pump(me, sub))
 
+    _conns[me] = _conns.get(me, 0) + 1
     q = asyncio.Queue(maxsize=200)
-    old = _queues.get(me)
     _queues[me] = q
 
     async def gen():
@@ -282,6 +309,11 @@ async def events(authorization: str | None = Header(default=None)):
         finally:
             if _queues.get(me) is q:
                 _queues.pop(me, None)
+            _conns[me] -= 1
+            if _conns.get(me, 0) <= 0:
+                # 最后一个 SSE 连接断开 → 回收 sub/pump/durable
+                _conns.pop(me, None)
+                await _cleanup_agent(me)
 
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
