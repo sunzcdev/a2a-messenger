@@ -2,7 +2,7 @@
 """a2a — 跨 Agent 消息 CLI (NATS JetStream 总线)
 
 用法:
-  a2a inbox [--unread] [--since N] [--limit N] [--json]
+  a2a inbox [--unread] [--since N] [--limit N] [--thread ID] [--group] [--json]
   a2a send <to> <subject> <body>   # to 支持逗号分隔多收件人, 如 "hermes,see"
   a2a reply <id> <body>
   a2a mark-read <id>
@@ -103,6 +103,8 @@ def cmd_inbox(args, base, tok):
         params.append(f"since={args.since}")
     if args.limit:
         params.append(f"limit={args.limit}")
+    if args.thread:
+        params.append(f"thread={args.thread}")
     if params:
         path += "?" + "&".join(params)
     code, d = req(base, path, tok)
@@ -112,10 +114,22 @@ def cmd_inbox(args, base, tok):
         print(json.dumps(d, ensure_ascii=False, indent=2))
         return
     msgs = d["messages"]
-    print(f"收件箱 {d['agent']}: {d['count']} 条")
-    for m in msgs:
-        print(fmt_msg(m))
-        print()
+    if args.group:
+        # T9: 按 thread 分组显示
+        groups = {}
+        for m in msgs:
+            groups.setdefault(m.get("thread") or "(无主题)", []).append(m)
+        print(f"收件箱 {d['agent']}: {d['count']} 条, {len(groups)} 个会话")
+        for g, gmsgs in groups.items():
+            print(f"\n=== {g} ({len(gmsgs)} 条) ===")
+            for m in gmsgs:
+                print(fmt_msg(m))
+                print()
+    else:
+        print(f"收件箱 {d['agent']}: {d['count']} 条")
+        for m in msgs:
+            print(fmt_msg(m))
+            print()
 
 
 def cmd_send(args, base, tok):
@@ -137,8 +151,21 @@ def cmd_send(args, base, tok):
 
 
 def cmd_reply(args, base, tok):
+    # 自动继承原消息 thread (T9): 在收件箱里找原消息
+    thread = None
+    try:
+        code0, d0 = req(base, "/api/inbox/me?limit=1000", tok)
+        if code0 == 200:
+            for m in d0.get("messages", []):
+                if m["id"] == args.id:
+                    thread = m.get("thread")
+                    break
+    except SystemExit:
+        pass
     payload = {"to": args.to, "subject": args.subject, "body": args.body,
                "reply_to": args.id, "msg_id": str(uuid.uuid4())}
+    if thread:
+        payload["thread"] = thread
     code, d = req(base, "/api/send", tok, "POST", payload)
     if code != 200:
         sys.exit(f"ERROR {code}: {d}")
@@ -235,6 +262,8 @@ def main():
     sp.add_argument("--unread", action="store_true")
     sp.add_argument("--since", type=int)
     sp.add_argument("--limit", type=int, default=200)
+    sp.add_argument("--thread", help="按 thread 过滤 (T9)")
+    sp.add_argument("--group", action="store_true", help="按 thread 分组显示 (T9)")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("send", help="发消息")

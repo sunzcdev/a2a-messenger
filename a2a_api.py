@@ -189,7 +189,8 @@ def _sort_key(it: dict):
 
 @app.get("/api/inbox/{agent}")
 async def inbox(agent: str, authorization: str | None = Header(default=None),
-                since: int | None = None, limit: int = 200, unread_only: bool = False):
+                since: int | None = None, limit: int = 200, unread_only: bool = False,
+                thread: str | None = None):
     me = require_agent(authorization)
     if agent == NOTICE:
         raise HTTPException(400,
@@ -233,6 +234,8 @@ async def inbox(agent: str, authorization: str | None = Header(default=None),
             continue
         items.append(_msg_item(seq, data, st))
     items.sort(key=_sort_key)  # 按 created 时间升序 (旧→新); 坏时间兜底 seq
+    if thread is not None:
+        items = [it for it in items if it.get("thread") == thread]  # T9: thread 过滤
     if since is not None:
         items = [it for it in items if it["id"] > since]
     else:
