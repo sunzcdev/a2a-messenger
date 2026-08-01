@@ -49,6 +49,7 @@ _subs: dict[str, object] = {}           # agent -> push subscription
 _pump_tasks: dict[str, asyncio.Task] = {}  # agent -> SSE pump task (可取消)
 _queues: dict[str, asyncio.Queue] = {}  # agent -> SSE 分发队列 (当前连接)
 _conns: dict[str, int] = {}             # agent -> 活跃 SSE 连接数
+_last_seen: dict[str, float] = {}       # agent -> 最近一次 SSE 活跃 (epoch, presence 用)
 _shutdown = asyncio.Event()            # SIGTERM/SIGINT 置位 → SSE gen 快速退出
 
 
@@ -268,6 +269,7 @@ async def _pump(agent: str, sub):
                 item = _msg_item(seq, data, "unread")
                 q = _queues.get(agent)
                 if q:
+                    _last_seen[agent] = time.time()  # presence: 活跃更新
                     try:
                         q.put_nowait(item)
                     except asyncio.QueueFull:
@@ -303,6 +305,7 @@ async def events(authorization: str | None = Header(default=None)):
         _pump_tasks[me] = asyncio.create_task(_pump(me, sub))
 
     _conns[me] = _conns.get(me, 0) + 1
+    _last_seen[me] = time.time()  # presence: 连接即在线
     q = asyncio.Queue(maxsize=200)
     _queues[me] = q
 
@@ -372,6 +375,20 @@ async def contacts():
         "agents": sorted(set(_TOKEN2AGENT.values())),
         "notice": "全网通知地址: to=notice 会广播给所有 agent (from 保留发送者, 各收件箱独立)",
     }
+
+
+@app.get("/api/presence")
+async def presence(authorization: str | None = Header(default=None)):
+    """各 agent 在线状态: online=是否有活跃 SSE 连接, last_seen=最近活跃时刻。只读。"""
+    require_agent(authorization)
+    out = {}
+    for agent in sorted(set(_TOKEN2AGENT.values())):
+        ls = _last_seen.get(agent)
+        out[agent] = {
+            "online": _conns.get(agent, 0) > 0,
+            "last_seen": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ls)) if ls else None,
+        }
+    return out
 
 
 @app.get("/api/health")

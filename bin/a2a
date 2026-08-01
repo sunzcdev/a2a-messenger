@@ -9,6 +9,7 @@
   a2a status <id> <status>
   a2a watch [--json]            # SSE 实时监听新消息
   a2a contacts
+  a2a presence               # 各 agent 在线状态
   a2a health
 
 配置 (环境变量):
@@ -195,6 +196,18 @@ def cmd_contacts(args, base, tok):
         print(d["notice"])
 
 
+def cmd_presence(args, base, tok):
+    """查看各 agent 在线状态 (online=活跃 SSE 连接, last_seen=最近活跃)"""
+    code, d = req(base, "/api/presence", tok)
+    if code != 200:
+        sys.exit(f"ERROR {code}: {d}")
+    for agent in sorted(d):
+        p = d[agent]
+        icon = "🟢" if p["online"] else "⚪"
+        ls = p.get("last_seen") or "-"
+        print(f"  {icon} {agent:<12} last_seen: {ls}")
+
+
 def cmd_health(args, base, tok):
     code, d = req(base, "/api/health", tok)
     if code != 200:
@@ -247,6 +260,7 @@ def main():
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("contacts", help="Agent 列表")
+    sp = sub.add_parser("presence", help="各 agent 在线状态")
     sp = sub.add_parser("health", help="健康检查")
     sp = sub.add_parser("whoami", help="验证当前 token 绑定的身份 (自查 token 是否配错)")
 
@@ -268,6 +282,8 @@ def main():
         cmd_watch(args, base, tok)
     elif args.cmd == "contacts":
         cmd_contacts(args, base, tok)
+    elif args.cmd == "presence":
+        cmd_presence(args, base, tok)
     elif args.cmd == "health":
         cmd_health(args, base, tok)
     elif args.cmd == "whoami":
