@@ -1,0 +1,15 @@
+[Unit]
+Description=A2A Octopus Tools Micro Service (octopus.tools)
+After=nats-server.service
+Requires=nats-server.service
+
+[Service]
+ExecStart=/home/ubuntu/projects/a2a-bus/venv/bin/python /home/ubuntu/projects/a2a-bus/services/octopus_service.py
+EnvironmentFile=/etc/a2a-api.env
+WorkingDirectory=/home/ubuntu/projects/a2a-bus
+Restart=always
+RestartSec=3
+User=ubuntu
+
+[Install]
+WantedBy=multi-user.target
