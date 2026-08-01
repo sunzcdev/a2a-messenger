@@ -3,7 +3,7 @@
 
 用法:
   a2a inbox [--unread] [--since N] [--limit N] [--json]
-  a2a send <to> <subject> <body>
+  a2a send <to> <subject> <body>   # to 支持逗号分隔多收件人, 如 "hermes,see"
   a2a reply <id> <body>
   a2a mark-read <id>
   a2a status <id> <status>
@@ -119,14 +119,20 @@ def cmd_inbox(args, base, tok):
 
 def cmd_send(args, base, tok):
     body = args.body or ""
-    payload = {"to": args.to, "subject": args.subject, "body": body,
+    targets = [t.strip() for t in args.to.split(",") if t.strip()]
+    to = targets[0] if len(targets) == 1 else targets
+    payload = {"to": to, "subject": args.subject, "body": body,
                "msg_id": str(uuid.uuid4())}  # 幂等键, 服务端 DuplicateWindow 内同 id 去重
     if args.reply_to:
         payload["reply_to"] = args.reply_to
     code, d = req(base, "/api/send", tok, "POST", payload)
     if code != 200:
         sys.exit(f"ERROR {code}: {d}")
-    print(f"✅ 已发送 #{d['id']} → {d['to']} [{d['status']}]")
+    if isinstance(d.get("to"), list):
+        n = len(d.get("seqs", [])) or len(d["to"])
+        print(f"✅ 已发送 #{d['id']} → {n} 个收件人 {d['to']} [unread]")
+    else:
+        print(f"✅ 已发送 #{d['id']} → {d['to']} [{d['status']}]")
 
 
 def cmd_reply(args, base, tok):

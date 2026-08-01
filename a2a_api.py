@@ -98,7 +98,7 @@ app = FastAPI(title="a2a-bus", lifespan=lifespan)
 
 
 class SendReq(BaseModel):
-    to: str
+    to: str | list[str]
     subject: str
     body: str = ""
     reply_to: int | None = None
@@ -109,7 +109,20 @@ class SendReq(BaseModel):
 @app.post("/api/send")
 async def send(req: SendReq, authorization: str | None = Header(default=None)):
     me = require_agent(authorization)
-    check_slug(req.to)
+    # 归一化收件人: 单个字符串或数组; notice 出现在目标中 → 并集含全部 agent
+    if isinstance(req.to, str):
+        raw_to = req.to
+        targets = [req.to]
+    else:
+        raw_to = list(req.to)
+        targets = list(req.to)
+    if not targets:
+        raise HTTPException(400, "to 不能为空")
+    if NOTICE in targets:
+        # notice 是广播地址: 展开为所有注册 agent, notice 自身不投递
+        targets = sorted((set(targets) - {NOTICE}) | set(_TOKEN2AGENT.values()))
+    for t in targets:
+        check_slug(t)
     if not req.subject.strip():
         raise HTTPException(400, "subject required")
     msg = {
@@ -123,20 +136,18 @@ async def send(req: SendReq, authorization: str | None = Header(default=None)):
     }
     # 幂等: 有 msg_id 时加 Nats-Msg-Id header, stream DuplicateWindow(2m) 内同 id 只存一条
     hdrs = {"Nats-Msg-Id": req.msg_id} if req.msg_id else None
-    # 全网通知: to=notice → 扇出复制到每个注册 agent 的收件箱 (各自独立 seq + 状态)
-    if req.to == NOTICE:
-        targets = sorted(set(_TOKEN2AGENT.values()))
-        seqs = []
-        for t in targets:
-            ack = await js.publish(f"a2a.{t}.inbox", json.dumps(msg).encode(), headers=hdrs)
-            await kv.put(str(ack.seq), b"unread")
-            seqs.append(ack.seq)
-        return {"id": seqs[0], "status": "unread", "to": req.to,
+    # 扇出到各收件人 (各自独立 seq + 状态); 复用 notice 逻辑, 支持多收件人
+    seqs = []
+    for t in targets:
+        ack = await js.publish(f"a2a.{t}.inbox", json.dumps(msg).encode(), headers=hdrs)
+        await kv.put(str(ack.seq), b"unread")
+        seqs.append(ack.seq)
+    if raw_to == NOTICE:
+        return {"id": seqs[0], "status": "unread", "to": NOTICE,
                 "broadcast_to": targets, "seqs": seqs}
-    ack = await js.publish(f"a2a.{req.to}.inbox", json.dumps(msg).encode(), headers=hdrs)
-    seq = ack.seq
-    await kv.put(str(seq), b"unread")
-    return {"id": seq, "status": "unread", "to": req.to}
+    if isinstance(raw_to, str):
+        return {"id": seqs[0], "status": "unread", "to": raw_to}
+    return {"id": seqs[0], "status": "unread", "to": raw_to, "seqs": seqs}
 
 
 def _msg_item(seq: int, data: dict, status: str) -> dict:
