@@ -16,6 +16,8 @@ import re
 import time
 from contextlib import asynccontextmanager
 
+from datetime import datetime, timezone
+
 import nats
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
@@ -147,6 +149,15 @@ async def _kv_status(seq: int) -> str:
         return "unread"
 
 
+def _sort_key(it: dict):
+    """收件箱按 created 时间排序; created 缺失/格式坏 (如旧迁移消息) 兜底按 seq。"""
+    try:
+        ts = datetime.fromisoformat((it.get("created") or "").replace("Z", "+00:00"))
+        return (0, ts, it["id"])
+    except Exception:
+        return (1, datetime.min.replace(tzinfo=timezone.utc), it["id"])
+
+
 @app.get("/api/inbox/{agent}")
 async def inbox(agent: str, authorization: str | None = Header(default=None),
                 since: int | None = None, limit: int = 200, unread_only: bool = False):
@@ -177,7 +188,7 @@ async def inbox(agent: str, authorization: str | None = Header(default=None),
         if unread_only and st != "unread":
             continue
         items.append(_msg_item(seq, data, st))
-    items.sort(key=lambda x: x["id"])
+    items.sort(key=_sort_key)  # 按 created 时间升序 (旧→新); 坏时间兜底 seq
     if since is not None:
         items = [it for it in items if it["id"] > since]
     else:
