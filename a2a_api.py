@@ -117,6 +117,10 @@ class VoteReq(BaseModel):
     option: str = "赞成"
 
 
+class ServiceCallReq(BaseModel):
+    data: str = ""
+
+
 @app.post("/api/send")
 async def send(req: SendReq, authorization: str | None = Header(default=None)):
     me = require_agent(authorization)
@@ -494,6 +498,73 @@ async def presence(authorization: str | None = Header(default=None)):
             "last_seen": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ls)) if ls else None,
         }
     return out
+
+
+async def _discover_services() -> list[dict]:
+    """NATS micro 服务发现 (T14): 发布 {} 到 $SRV.INFO + reply inbox, 收集服务 INFO。
+    支持 <agent-slug>.<能力> 带点号服务名 (nats CLI 会拒绝, 故走自有发现)。"""
+    inbox = f"_INBOX.srvdisco.{uuid.uuid4().hex}"
+    q = asyncio.Queue()
+    start = time.monotonic()
+
+    async def _cb(msg):
+        try:
+            info = json.loads(msg.data)
+            q.put_nowait((info, (time.monotonic() - start) * 1000))
+        except Exception:
+            pass
+
+    sub = await nc.subscribe(inbox, cb=_cb)
+    await nc.publish("$SRV.INFO", b"{}", reply=inbox)
+    entries = []
+    while time.monotonic() - start < 0.8:
+        try:
+            entries.append(await asyncio.wait_for(q.get(), timeout=0.2))
+        except asyncio.TimeoutError:
+            continue
+    try:
+        await sub.unsubscribe()
+    except Exception:
+        pass
+    out = []
+    seen = set()
+    for info, rtt in entries:
+        name = info.get("name")
+        sid = info.get("id")
+        if (name, sid) in seen:
+            continue
+        seen.add((name, sid))
+        out.append({
+            "name": name, "id": sid, "version": info.get("version"),
+            "description": info.get("description"),
+            "endpoints": [e.get("name") for e in info.get("endpoints", [])],
+            "rtt_ms": round(rtt, 1),
+        })
+    return sorted(out, key=lambda x: x["name"] or "")
+
+
+@app.get("/api/services")
+async def services(authorization: str | None = Header(default=None)):
+    """列出所有已注册的 NATS micro 服务 (T14)。"""
+    require_agent(authorization)
+    return {"services": await _discover_services()}
+
+
+@app.post("/api/services/{name}/{endpoint}")
+async def service_call(name: str, endpoint: str, req: ServiceCallReq,
+                       authorization: str | None = Header(default=None)):
+    """调用服务端点 (T14): request-reply 到 $SRV.REQ.<name>.<endpoint>。"""
+    require_agent(authorization)
+    subject = f"$SRV.REQ.{name}.{endpoint}"
+    try:
+        resp = await nc.request(subject, req.data.encode(), timeout=5)
+    except Exception as e:
+        raise HTTPException(504, f"service call failed: {e}")
+    try:
+        result = json.loads(resp.data)
+    except Exception:
+        result = resp.data.decode()
+    return {"service": name, "endpoint": endpoint, "result": result}
 
 
 @app.get("/api/health")

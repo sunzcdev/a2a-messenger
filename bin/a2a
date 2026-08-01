@@ -12,6 +12,7 @@
   a2a ask <to> <问题...> [--timeout N]  # 提问挂起等回复 (reply_to 匹配), 默认超时 600s
   a2a vote <topic> <proposal> [option]  # 投票 (每 agent 一票)
   a2a votes <topic> <proposal>          # 查看投票
+  a2a service list | ping <name> | call <name> <endpoint> <data>  # 服务注册表
   a2a contacts
   a2a presence               # 各 agent 在线状态
   a2a health
@@ -361,6 +362,42 @@ def cmd_votes(args, base, tok):
         print(f"  - {v}")
 
 
+def cmd_service(args, base, tok):
+    """service list / ping / call (T14): NATS micro 服务注册表"""
+    if args.service_cmd == "list":
+        code, d = req(base, "/api/services", tok)
+        if code != 200:
+            sys.exit(f"ERROR {code}: {d}")
+        svcs = d.get("services", [])
+        print(f"🛠️ 已注册服务: {len(svcs)} 个")
+        for s in svcs:
+            eps = ", ".join(s.get("endpoints", []))
+            rtt = s.get("rtt_ms")
+            rtt_s = f"rtt={rtt}ms" if rtt is not None else "rtt=?"
+            print(f"  {s['name']}  v{s.get('version', '?')}  [{eps}]  {rtt_s}")
+            if s.get("description"):
+                print(f"     {s['description']}")
+    elif args.service_cmd == "ping":
+        code, d = req(base, "/api/services", tok)
+        if code != 200:
+            sys.exit(f"ERROR {code}: {d}")
+        found = [s for s in d.get("services", []) if s["name"] == args.name]
+        if not found:
+            sys.exit(f"❌ 未找到服务 {args.name}")
+        s = found[0]
+        rtt = s.get("rtt_ms")
+        print(f"🏓 {s['name']} 在线 (rtt={rtt}ms, v{s.get('version', '?')})" if rtt is not None
+              else f"🏓 {s['name']} 在线")
+    elif args.service_cmd == "call":
+        code, d = req(base, f"/api/services/{args.name}/{args.endpoint}", tok,
+                      "POST", {"data": args.data})
+        if code != 200:
+            sys.exit(f"ERROR {code}: {d}")
+        result = d.get("result")
+        out = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+        print(f"📞 {args.name}.{args.endpoint} → {out}")
+
+
 def cmd_contacts(args, base, tok):
     code, d = req(base, "/api/contacts", tok)
     if code != 200:
@@ -454,6 +491,16 @@ def main():
     sp.add_argument("topic")
     sp.add_argument("proposal")
 
+    sp = sub.add_parser("service", help="服务注册表 (T14)")
+    sp2 = sp.add_subparsers(dest="service_cmd", required=True)
+    sp2.add_parser("list", help="列出所有已注册服务")
+    spp = sp2.add_parser("ping", help="探测服务 (rtt)")
+    spp.add_argument("name")
+    spc = sp2.add_parser("call", help="调用服务端点")
+    spc.add_argument("name")
+    spc.add_argument("endpoint")
+    spc.add_argument("data", nargs="?", default="", help="请求数据 (可选)")
+
     sp = sub.add_parser("contacts", help="Agent 列表")
     sp = sub.add_parser("presence", help="各 agent 在线状态")
     sp = sub.add_parser("health", help="健康检查")
@@ -483,6 +530,8 @@ def main():
         cmd_vote(args, base, tok)
     elif args.cmd == "votes":
         cmd_votes(args, base, tok)
+    elif args.cmd == "service":
+        cmd_service(args, base, tok)
     elif args.cmd == "contacts":
         cmd_contacts(args, base, tok)
     elif args.cmd == "presence":
