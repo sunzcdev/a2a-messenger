@@ -390,7 +390,7 @@ def cmd_service(args, base, tok):
               else f"🏓 {s['name']} 在线")
     elif args.service_cmd == "call":
         code, d = req(base, f"/api/services/{args.name}/{args.endpoint}", tok,
-                      "POST", {"data": args.data})
+                      "POST", {"data": args.data, "timeout": args.timeout})
         if code != 200:
             sys.exit(f"ERROR {code}: {d}")
         result = d.get("result")
@@ -500,6 +500,7 @@ def main():
     spc.add_argument("name")
     spc.add_argument("endpoint")
     spc.add_argument("data", nargs="?", default="", help="请求数据 (可选)")
+    spc.add_argument("--timeout", type=int, default=5, help="超时秒数 (默认 5)")
 
     sp = sub.add_parser("contacts", help="Agent 列表")
     sp = sub.add_parser("presence", help="各 agent 在线状态")

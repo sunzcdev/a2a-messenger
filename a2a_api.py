@@ -11,10 +11,13 @@
 """
 import asyncio
 import contextlib
+import hashlib
+import hmac
 import json
 import os
 import re
 import time
+import urllib.parse
 import uuid
 from contextlib import asynccontextmanager
 
@@ -30,6 +33,20 @@ NATS_URL = os.environ.get("A2A_NATS_URL", "nats://127.0.0.1:4222")
 STREAM = "A2A"
 KV_BUCKET = "a2a-status"
 PORT = int(os.environ.get("A2A_API_PORT", "3010"))
+
+# ── Webhook 唤醒 (T15: 发送即唤醒离线接收方) ──────────────────────────
+# send() 扇出后，对每个"离线"收件人（无活跃 SSE 连接）异步 POST 一条
+# HMAC V2 签名的通知到其注册的 webhook URL，触发接收方 Hermes 跑订阅路由
+# 查收件箱。在线收件人 SSE 已送达，跳过推送，避免重复处理。
+# 认证：单一共享 secret (env A2A_WEBHOOK_SECRET)，所有 route 共用；
+# 签名走 V2（X-Webhook-Signature-V2 + X-Webhook-Timestamp，300s 防重放），
+# 不走 V1（只签 body、无防重放）。幂等键 X-GitHub-Delivery = "{seq}:{recipient}"。
+WEBHOOK_KV = "a2a-webhook"
+WEBHOOK_SECRET = os.environ.get("A2A_WEBHOOK_SECRET", "")
+WEBHOOK_TIMEOUT = float(os.environ.get("A2A_WEBHOOK_TIMEOUT", "2.0"))   # 单次 POST 超时
+WEBHOOK_CONCURRENCY = int(os.environ.get("A2A_WEBHOOK_CONCURRENCY", "10"))  # 全局并发上限
+WEBHOOK_MIN_INTERVAL = float(os.environ.get("A2A_WEBHOOK_MIN_INTERVAL", "30"))  # per-recipient 冷却
+WEBHOOK_ENABLED = os.environ.get("A2A_WEBHOOK_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
 
 # A2A_TOKENS="octopus:tok1,hermes:tok2,..." → token → agent slug
 _TOKEN2AGENT = {}
@@ -59,6 +76,120 @@ def check_slug(s: str):
         raise HTTPException(400, f"invalid agent slug: {s!r}")
 
 
+# ── Webhook 唤醒实现 ──────────────────────────────────────────────────
+# 三层防风暴：
+#   1) 在线跳过 —— _conns[recipient] > 0 时 SSE 已送达，不推
+#   2) 全局 Semaphore(WEBHOOK_CONCURRENCY) + 单次超时 WEBHOOK_TIMEOUT，失败静默
+#   3) per-recipient 冷却 —— WEBHOOK_MIN_INTERVAL 内同一收件人只推一次
+# notify 走 asyncio.create_task，send 不 await，绝不阻塞主流程；
+# 残留 task 在 lifespan 关闭时统一取消。
+_notify_tasks: set[asyncio.Task] = set()
+_notify_sem: asyncio.Semaphore | None = None
+_notify_last_push: dict[str, float] = {}   # recipient -> 上次推送 epoch
+
+
+def _wh_sign(secret: str, timestamp: str, body: bytes) -> str:
+    """HMAC-SHA256 V2: hex(hmac(secret, "<timestamp>.<body>"))."""
+    return hmac.new(secret.encode(), f"{timestamp}.".encode() + body, hashlib.sha256).hexdigest()
+
+
+async def _wh_post(url: str, payload: dict, delivery_id: str) -> bool:
+    """POST 一条 webhook 通知，返回是否成功。失败/超时一律静默（调用方吞异常）。"""
+    import httpx
+    body = json.dumps(payload, ensure_ascii=False).encode()
+    ts = str(int(time.time()))
+    headers = {
+        "Content-Type": "application/json",
+        "X-Webhook-Timestamp": ts,
+        "X-Webhook-Signature-V2": _wh_sign(WEBHOOK_SECRET, ts, body),
+        "X-GitHub-Delivery": delivery_id,
+    }
+    async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as c:
+        r = await c.post(url, content=body, headers=headers)
+        return r.status_code < 500
+
+
+async def _notify_one(recipient: str, seq: int, msg: dict) -> None:
+    """单收件人的 webhook 唤醒：查映射 → 冷却判定 → 限流 → POST。全部异常静默。"""
+    if kv is None:
+        return
+    try:
+        # 1) 查映射表
+        try:
+            e = await kv.get(f"webhook.{recipient}", validate_keys=False)
+            entry = json.loads(e.value.decode()) if e and e.value else None
+        except Exception:
+            entry = None
+        if not entry or not entry.get("url"):
+            return
+        url = entry["url"]
+
+        # 2) per-recipient 冷却（幂等 key 已防重试，这里防 notice 刷屏）
+        now = time.time()
+        last = _notify_last_push.get(recipient)
+        if last is not None and now - last < WEBHOOK_MIN_INTERVAL:
+            return
+        _notify_last_push[recipient] = now
+
+        # 3) 全局限流 + 超时
+        sem = _notify_sem
+        if sem is not None:
+            async with sem:
+                await _wh_post(url, msg, f"{seq}:{recipient}")
+        else:
+            await _wh_post(url, msg, f"{seq}:{recipient}")
+    except Exception:
+        # 唤醒是 best-effort：绝不让通知失败影响 send 主流程
+        pass
+
+
+async def _notify_offline(recipients: list[str], seqs: list[int], msg: dict) -> None:
+    """对所有离线收件人异步推送 webhook 唤醒。"""
+    for recipient, seq in zip(recipients, seqs):
+        if _conns.get(recipient, 0) > 0:
+            continue  # 在线：SSE 已送达，不推
+        t = asyncio.create_task(_notify_one(recipient, seq, msg))
+        _notify_tasks.add(t)
+        t.add_done_callback(_notify_tasks.discard)
+
+
+async def _register_webhook(agent: str, url: str) -> dict:
+    """把 agent 的 webhook URL 写入 NATS KV a2a-webhook。"""
+    if kv is None:
+        raise HTTPException(503, "KV not ready")
+    entry = {"url": url, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    await kv.put(f"webhook.{agent}", json.dumps(entry).encode(), validate_keys=False)
+    return entry
+
+
+async def _get_webhook(agent: str) -> dict | None:
+    if kv is None:
+        return None
+    try:
+        e = await kv.get(f"webhook.{agent}", validate_keys=False)
+        return json.loads(e.value.decode()) if e and e.value else None
+    except Exception:
+        return None
+
+
+async def _list_webhooks() -> dict[str, dict]:
+    if kv is None:
+        return {}
+    out = {}
+    try:
+        for k in await kv.keys(filters=["webhook."]):
+            e = await kv.get(k, validate_keys=False)
+            if e and e.value:
+                out[k[len("webhook."):]] = json.loads(e.value.decode())
+    except Exception:
+        pass
+    return out
+
+
+class WebhookRegReq(BaseModel):
+    url: str
+
+
 def require_agent(auth: str | None) -> str:
     if not auth or not auth.startswith("Bearer "):
         raise HTTPException(401, "missing bearer token")
@@ -70,13 +201,22 @@ def require_agent(auth: str | None) -> str:
 
 @asynccontextmanager
 async def lifespan(_app):
-    global nc, js, kv
+    global nc, js, kv, _notify_sem
     nc = await nats.connect(NATS_URL)
     js = nc.jetstream()
     try:
         kv = await js.key_value(bucket=KV_BUCKET)
     except Exception:
         kv = await js.create_key_value(bucket=KV_BUCKET)
+    # T15: webhook 唤醒用的独立 KV bucket (agent -> webhook URL 映射)
+    try:
+        await js.key_value(bucket=WEBHOOK_KV)
+    except Exception:
+        try:
+            await js.create_key_value(bucket=WEBHOOK_KV)
+        except Exception:
+            pass
+    _notify_sem = asyncio.Semaphore(WEBHOOK_CONCURRENCY)
     try:
         await js.stream_info(STREAM)
     except Exception:
@@ -95,6 +235,13 @@ async def lifespan(_app):
         await _cleanup_agent(agent)
     _queues.clear()
     _conns.clear()
+    # T15: 取消残留 webhook 唤醒 task，避免进程退出时挂起
+    for t in list(_notify_tasks):
+        t.cancel()
+    if _notify_tasks:
+        await asyncio.gather(*_notify_tasks, return_exceptions=True)
+    _notify_tasks.clear()
+    _notify_sem = None
     if nc:
         await nc.drain()
 
@@ -118,6 +265,7 @@ class VoteReq(BaseModel):
 
 
 class ServiceCallReq(BaseModel):
+    timeout: int = 5
     data: str = ""
 
 
@@ -157,6 +305,7 @@ async def send(req: SendReq, authorization: str | None = Header(default=None)):
     # Nats-Msg-Id: 有 msg_id → f"{msg_id}:{t}" (同收件人重试仍去重, T6 语义保留);
     # 无 msg_id → 每副本独立 uuid。
     seqs = []
+    wh_pairs = []   # T15: (recipient, seq) — 需 webhook 唤醒的个人收件人
     for t in targets:
         per_msg_id = f"{req.msg_id}:{t}" if req.msg_id else str(uuid.uuid4())
         if ROOM_RE.match(t):
@@ -172,6 +321,12 @@ async def send(req: SendReq, authorization: str | None = Header(default=None)):
                                    headers={"Nats-Msg-Id": per_msg_id})
             await kv.put(str(ack.seq), b"unread")
             seqs.append(ack.seq)
+            wh_pairs.append((t, ack.seq))   # T15: 记下个人收件人供唤醒
+    # T15: 对离线收件人异步 webhook 唤醒。create_task 火线 forget,
+    # send 立即返回，绝不阻塞主流程；异常全吞，唤醒失败不影响投递。
+    if WEBHOOK_ENABLED and WEBHOOK_SECRET and wh_pairs:
+        asyncio.create_task(_notify_offline([p[0] for p in wh_pairs],
+                                            [p[1] for p in wh_pairs], msg))
     if raw_to == NOTICE:
         return {"id": seqs[0], "status": "unread", "to": NOTICE,
                 "broadcast_to": targets, "seqs": seqs}
@@ -478,6 +633,54 @@ async def whoami(authorization: str | None = Header(default=None)):
     return {"agent": require_agent(authorization)}
 
 
+# ── Webhook 唤醒注册 (T15) ─────────────────────────────────────────────
+@app.post("/api/register-webhook")
+async def register_webhook(req: WebhookRegReq,
+                           authorization: str | None = Header(default=None)):
+    """登记本 agent 的 webhook URL。Bearer token 认证，只能登记自己。
+    数据写入 NATS KV a2a-webhook (key webhook.<agent>)，a2a-api 重启不丢。"""
+    me = require_agent(authorization)
+    url = req.url.strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(400, "url must start with http:// or https://")
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.netloc:
+        raise HTTPException(400, "invalid url")
+    entry = await _register_webhook(me, url)
+    return {"agent": me, **entry}
+
+
+@app.get("/api/webhooks")
+async def list_webhooks(authorization: str | None = Header(default=None)):
+    """列出所有已登记的 webhook 映射（只读，不含 secret）。"""
+    require_agent(authorization)
+    out = {}
+    for agent, e in (await _list_webhooks()).items():
+        out[agent] = {"url": e.get("url"), "ts": e.get("ts")}
+    return {"webhooks": out}
+
+
+@app.get("/api/webhooks/me")
+async def my_webhook(authorization: str | None = Header(default=None)):
+    """查看本 agent 自己的 webhook 映射。"""
+    me = require_agent(authorization)
+    e = await _get_webhook(me)
+    return {"agent": me, "webhook": e}
+
+
+@app.delete("/api/webhooks/me")
+async def delete_webhook(authorization: str | None = Header(default=None)):
+    """注销本 agent 的 webhook。"""
+    if kv is None:
+        raise HTTPException(503, "KV not ready")
+    me = require_agent(authorization)
+    try:
+        await kv.delete(f"webhook.{me}", validate_keys=False)
+    except Exception:
+        pass
+    return {"agent": me, "deleted": True}
+
+
 @app.get("/api/contacts")
 async def contacts():
     return {
@@ -557,7 +760,7 @@ async def service_call(name: str, endpoint: str, req: ServiceCallReq,
     require_agent(authorization)
     subject = f"$SRV.REQ.{name}.{endpoint}"
     try:
-        resp = await nc.request(subject, req.data.encode(), timeout=5)
+        resp = await nc.request(subject, req.data.encode(), timeout=req.timeout)
     except Exception as e:
         raise HTTPException(504, f"service call failed: {e}")
     try:
@@ -570,8 +773,16 @@ async def service_call(name: str, endpoint: str, req: ServiceCallReq,
 @app.get("/api/health")
 async def health():
     si = await js.stream_info(STREAM)
+    wh_count = 0
+    if kv is not None:
+        try:
+            wh_count = len(await kv.keys(filters=["webhook."]))
+        except Exception:
+            pass
     return {"ok": True, "stream": STREAM,
-            "messages": si.state.messages, "last_seq": si.state.last_seq}
+            "messages": si.state.messages, "last_seq": si.state.last_seq,
+            "webhook": {"enabled": WEBHOOK_ENABLED, "secret_set": bool(WEBHOOK_SECRET),
+                        "registered": wh_count}}
 
 
 if __name__ == "__main__":
