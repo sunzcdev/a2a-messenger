@@ -35,9 +35,47 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 
 DEFAULT_URL = os.environ.get("A2A_URL", "http://100.68.80.91:3010")
 TOKENS_FILE = os.path.expanduser("~/projects/a2a-bus/tokens.env")
+
+# ── 显示层：agent slug → 昵称 (T1/T2) ────────────────────────────────
+# 收件箱/对话视图默认用昵称显示，不用裸 slug。未知 slug 兜底显示原 slug。
+AGENT_NICKNAME = {
+    "hermes": "雨雀",
+    "cc-oracle": "凤凰",
+    "claude-code": "CC-Tencent",
+    "octopus": "八爪鱼",
+    "reading-bot": "读书郎",
+    "see": "兮",
+}
+
+
+def agent_nickname(slug: str) -> str:
+    """slug → 显示昵称，未知 slug 兜底返回原 slug。"""
+    if not slug:
+        return ""
+    return AGENT_NICKNAME.get(slug, slug)
+
+
+def _fmt_preview(text: str, n: int = 80) -> str:
+    """单行预览：去掉换行、截断到 n 字。"""
+    if not text:
+        return ""
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= n else flat[: n - 1] + "…"
+
+
+def _ts_short(created: str, now_ts: float | None = None) -> str:
+    """created(ISO) → 短时间。同一天内 HH:MM，跨天 YYYY-MM-DD HH:MM。"""
+    try:
+        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+        if now_ts is not None and dt.timestamp() >= now_ts - 86400:
+            return dt.strftime("%H:%M")
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return created[11:16] if len(created) >= 16 else created
 
 
 def load_tokens():
@@ -123,8 +161,44 @@ def cmd_inbox(args, base, tok):
         print(json.dumps(d, ensure_ascii=False, indent=2))
         return
     msgs = d["messages"]
+    now_ts = time.time()
+
+    # T2: 对话视图 --chat <agent>。纯对话气泡，对方消息靠左、自己的靠右。
+    if args.chat:
+        me = d["agent"]
+        # 对话窗口只显示与对端的往来，不显示无关消息
+        peer = args.chat
+        convo = [m for m in msgs if m.get("from") == peer or m.get("to") == peer]
+        if not convo:
+            convo = msgs  # 无匹配时兜底显示全部，便于排查
+        last_ts = None
+        for m in convo:
+            sender = m.get("from", "")
+            ts = _ts_short(m.get("created") or "", now_ts)
+            # 时间戳只在间隔 >1h 时显示
+            try:
+                dt = datetime.fromisoformat((m.get("created") or "").replace("Z", "+00:00"))
+                cur_ts = dt.timestamp()
+                show_ts = last_ts is None or (cur_ts - last_ts) > 3600
+                last_ts = cur_ts
+            except Exception:
+                show_ts = True
+            if show_ts:
+                print(f"  [{ts}]")
+            body = (m.get("body") or "").strip() or (m.get("subject") or "").strip()
+            if sender == me:
+                # 自己的消息靠右
+                print(f"  {'':<2} {body}")
+            else:
+                # 对方消息靠左，只显示昵称首字
+                nick = agent_nickname(sender)
+                first = nick[:1] if nick else "?"
+                print(f"  {first}: {body}")
+            print()
+        return
+
     if args.group:
-        # T9: 按 thread 分组显示
+        # T9: 按 thread 分组显示（保留原详细格式）
         groups = {}
         for m in msgs:
             groups.setdefault(m.get("thread") or "(无主题)", []).append(m)
@@ -134,11 +208,24 @@ def cmd_inbox(args, base, tok):
             for m in gmsgs:
                 print(fmt_msg(m))
                 print()
-    else:
+        return
+
+    # T1: 默认通知中心视图 [HH:MM] 昵称: 预览（80字）
+    # --verbose 时退回完整详细格式（含 seq/箭头/ISO/Re:）
+    if args.verbose:
         print(f"收件箱 {d['agent']}: {d['count']} 条")
         for m in msgs:
             print(fmt_msg(m))
             print()
+        return
+
+    print(f"收件箱 {d['agent']}: {d['count']} 条")
+    for m in msgs:
+        created = m.get("created") or ""
+        ts = _ts_short(created, now_ts)
+        sender = agent_nickname(m.get("from", ""))
+        preview = _fmt_preview(m.get("body") or m.get("subject") or "")
+        print(f"  [{ts}] {sender}: {preview}")
 
 
 def cmd_send(args, base, tok):
@@ -164,16 +251,31 @@ def cmd_send(args, base, tok):
 def cmd_reply(args, base, tok):
     # 自动继承原消息 thread (T9): 在收件箱里找原消息
     thread = None
+    # T5: Subject 继承 — reply 时保留原始 subject，不叠加 Re:
+    subject = None
     try:
         code0, d0 = req(base, "/api/inbox/me?limit=1000", tok)
         if code0 == 200:
             for m in d0.get("messages", []):
                 if m["id"] == args.id:
                     thread = m.get("thread")
+                    subject = m.get("subject", "")
                     break
     except SystemExit:
         pass
-    payload = {"to": args.to, "subject": args.subject, "body": args.body,
+    # T5: Subject 继承 —— 回复时继承原 subject，不叠加 Re:。
+    # 规则：剥掉原 subject 前缀的所有 "Re:"（嵌套回复会累加多个），
+    # 还原成第一次 reply 时的原始主题；剥完为空才回落到用户传入的 subject。
+    def _strip_re_prefix(s: str) -> str:
+        prev = None
+        while prev != s:
+            prev = s
+            s = re.sub(r"^\s*(?:Re|RE|re)\s*:\s*", "", s)
+        return s.strip()
+
+    original = _strip_re_prefix(subject) if subject else ""
+    final_subject = original or args.subject or "无主题"
+    payload = {"to": args.to, "subject": final_subject, "body": args.body,
                "reply_to": args.id, "msg_id": str(uuid.uuid4())}
     if thread:
         payload["thread"] = thread
@@ -451,6 +553,8 @@ def main():
     sp.add_argument("--thread", help="按 thread 过滤 (T9)")
     sp.add_argument("--group", action="store_true", help="按 thread 分组显示 (T9)")
     sp.add_argument("--json", action="store_true")
+    sp.add_argument("--verbose", action="store_true", help="退回完整详细格式（含 seq/箭头/ISO/Re:）")
+    sp.add_argument("--chat", help="对话视图：与指定 agent 的纯对话气泡（T2）")
 
     sp = sub.add_parser("send", help="发消息")
     sp.add_argument("to")

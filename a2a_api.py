@@ -93,8 +93,13 @@ def _wh_sign(secret: str, timestamp: str, body: bytes) -> str:
     return hmac.new(secret.encode(), f"{timestamp}.".encode() + body, hashlib.sha256).hexdigest()
 
 
-async def _wh_post(url: str, payload: dict, delivery_id: str) -> bool:
-    """POST 一条 webhook 通知，返回是否成功。失败/超时一律静默（调用方吞异常）。"""
+async def _wh_post(url: str, payload: dict, delivery_id: str) -> tuple[bool, str]:
+    """POST 一条 webhook 通知，返回 (成功, 详情)。
+
+    T4: 原实现返回 bool 且失败静默，调用方无法区分"推送失败"和"成功"。
+    现在返回 (ok, detail)，detail 在失败时携带 http_status/error，由 _notify_one
+    记 logger.warning，send 照常返回 200，不因推送失败影响主流程。
+    """
     import httpx
     body = json.dumps(payload, ensure_ascii=False).encode()
     ts = str(int(time.time()))
@@ -104,13 +109,30 @@ async def _wh_post(url: str, payload: dict, delivery_id: str) -> bool:
         "X-Webhook-Signature-V2": _wh_sign(WEBHOOK_SECRET, ts, body),
         "X-GitHub-Delivery": delivery_id,
     }
-    async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as c:
-        r = await c.post(url, content=body, headers=headers)
-        return r.status_code < 500
+    try:
+        async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as c:
+            r = await c.post(url, content=body, headers=headers)
+        if r.status_code >= 400:
+            return False, f"http_status={r.status_code}"
+        return True, ""
+    except Exception as exc:
+        return False, f"exception={type(exc).__name__}: {exc}"
 
 
 async def _notify_one(recipient: str, seq: int, msg: dict) -> None:
-    """单收件人的 webhook 唤醒：查映射 → 冷却判定 → 限流 → POST。全部异常静默。"""
+    """单收件人的 webhook 唤醒：查映射 → 冷却判定 → 限流 → POST。
+
+    T3 payload 瘦身：只传最小唤醒信号 {from, ts}，正文由接收方自己
+    a2a inbox --unread --limit 1 拉取。原 msg 全量字段（from/seq/subject/
+    body/reply_to/thread）不再塞进 webhook payload —— 一是减少跨机传输量，
+    二是避免把 body 里可能的敏感内容通过 webhook 二次投递。
+    HMAC V2 签名照常（X-Webhook-Signature-V2 + X-Webhook-Timestamp），
+    瘦身不影响认证与防重放。
+
+    T4 推送失败独立日志：失败（HTTP 非 2xx / 超时 / 签名不匹配 / 连接失败）
+    记 logger.warning，含 recipient、url、http_status/error，便于复盘统计
+    真实推送成功率。send 照常返回 200，不因推送失败影响主流程。
+    """
     if kv is None:
         return
     try:
@@ -131,16 +153,33 @@ async def _notify_one(recipient: str, seq: int, msg: dict) -> None:
             return
         _notify_last_push[recipient] = now
 
-        # 3) 全局限流 + 超时
+        # 3) T3 payload 瘦身：只传 from + ts，正文由接收方自己拉
+        wake_payload = {
+            "from": msg.get("from", ""),
+            "ts": time.strftime("%H:%M", time.gmtime()),
+        }
+
+        # 4) 全局限流 + 超时
         sem = _notify_sem
         if sem is not None:
             async with sem:
-                await _wh_post(url, msg, f"{seq}:{recipient}")
+                ok = await _wh_post(url, wake_payload, f"{seq}:{recipient}")
         else:
-            await _wh_post(url, msg, f"{seq}:{recipient}")
-    except Exception:
+            ok = await _wh_post(url, wake_payload, f"{seq}:{recipient}")
+
+        # T4: 推送失败独立日志（成功不记，避免刷屏）
+        if not ok:
+            logger.warning(
+                "[a2a-webhook] push failed recipient=%s url=%s seq=%s "
+                "(http_status>=500 or timeout or connection error)",
+                recipient, url, seq,
+            )
+    except Exception as exc:
         # 唤醒是 best-effort：绝不让通知失败影响 send 主流程
-        pass
+        logger.warning(
+            "[a2a-webhook] push exception recipient=%s url=%s seq=%s error=%s",
+            recipient, entry.get("url", "") if entry else "", seq, exc,
+        )
 
 
 async def _notify_offline(recipients: list[str], seqs: list[int], msg: dict) -> None:
