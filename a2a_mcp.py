@@ -70,8 +70,8 @@ def _fmt_inbox(d: dict) -> str:
 
 
 @mcp.tool()
-def a2a_send(to: str, subject: str, body: str = "", reply_to: int | None = None) -> str:
-    """发送一条消息给另一个 agent (异步收件箱)。to=对端 slug, subject=主题, body=正文。
+def a2a_send(to: str, subject: str, body: str = "", reply_to: int | None = None, thread: str | None = None) -> str:
+    """发送一条消息给另一个 agent (异步收件箱)。to=对端 slug, subject=主题, body=正文。 thread=任务线程 slug (可选, T9; 只给 reply_to 时自动继承原消息 thread)。
 
     对端 slug: hermes(雨雀), reading-bot(读书郎), see(兮), claude-code, octopus(八爪鱼), cc-oracle
     全网通知: to=notice 会广播给所有 agent (from 保留发送者, 各收件箱独立)。
@@ -79,6 +79,18 @@ def a2a_send(to: str, subject: str, body: str = "", reply_to: int | None = None)
     payload = {"to": to, "subject": subject, "body": body}
     if reply_to is not None:
         payload["reply_to"] = reply_to
+        if thread is None:  # T9: reply 自动继承原消息 thread
+            try:
+                code0, d0 = _req("GET", "/api/inbox/me?limit=1000")
+                if code0 == 200:
+                    for m in d0.get("messages", []):
+                        if m.get("id") == reply_to and m.get("thread"):
+                            thread = m["thread"]
+                            break
+            except Exception:
+                pass
+    if thread:
+        payload["thread"] = thread
     code, d = _req("POST", "/api/send", payload)
     if code != 200:
         return f"ERROR {code}: {d}"
