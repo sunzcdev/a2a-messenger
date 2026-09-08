@@ -149,6 +149,8 @@ def cmd_send(args, base, tok):
                "msg_id": str(uuid.uuid4())}  # 幂等键, 服务端 DuplicateWindow 内同 id 去重
     if args.reply_to:
         payload["reply_to"] = args.reply_to
+    if getattr(args, "thread", None):
+        payload["thread"] = args.thread
     code, d = req(base, "/api/send", tok, "POST", payload)
     if code != 200:
         sys.exit(f"ERROR {code}: {d}")
@@ -455,6 +457,7 @@ def main():
     sp.add_argument("subject")
     sp.add_argument("body", nargs="?", default="")
     sp.add_argument("--reply-to", type=int)
+    sp.add_argument("--thread", help="任务线程 slug (T9, 与 gbrain slug 对齐, reply 自动继承)")
 
     sp = sub.add_parser("reply", help="回复消息并标 replied")
     sp.add_argument("id", type=int)
